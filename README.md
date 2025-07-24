@@ -12,7 +12,11 @@ but they didn't work on the windows machines i have to work on.
 I do not need a lot of features, just some convenience to run my processes in a
 single terminal with a single command from my `justfile`.
 
+A `gaffa` is someone who manages a group of performers, think of a rock band or
+circus. Whatever you like. 🧙‍♀️
+
 ## Features
+
 
 - **Cross-platform**: Works on Windows, macOS, and Linux without tmux dependency
 - **Process Management**: Start, stop, and restart processes individually in interactive mode
@@ -20,6 +24,8 @@ single terminal with a single command from my `justfile`.
 
 
 ## Installation
+
+Available on crates.io: [gaffa](https://crates.io/crates/gaffa)
 
 ```bash
 cargo install gaffa
