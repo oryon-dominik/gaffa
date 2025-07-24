@@ -1,0 +1,35 @@
+[package]
+name = "gaffa"
+version = "0.1.0"
+edition = "2024"
+authors = ["<oryon@cyberise.de>"]
+description = "Cross-platform process manager for Procfile-based process-collections."
+license-file = "LICENSE"
+repository = "https://github.com/oryon-dominik/gaffa"
+readme = "README.md"
+keywords = ["procfile", "process-manager", "foreman", "overmind", "honcho", "multiplexer"]
+categories = [
+    "command-line-utilities",
+    "development-tools"
+]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+colored = "3.0.0"
+regex = "1"
+shell-words = "1.1.0"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2.0.12"
+ratatui = "0.29"
+crossterm = "0.29"
+cli-clipboard = "0.4"
+chrono = "0.4"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[badges]
+github-actions = { repository = "oryon-dominik/gaffa", branch = "trunk" }
