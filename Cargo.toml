@@ -7,7 +7,7 @@ description = "Cross-platform process manager for Procfile-based process-collect
 license-file = "LICENSE"
 repository = "https://github.com/oryon-dominik/gaffa"
 readme = "README.md"
-keywords = ["procfile", "process-manager", "foreman", "overmind", "honcho", "multiplexer"]
+keywords = ["procfile", "process-manager", "foreman", "overmind", "honcho"]
 categories = [
     "command-line-utilities",
     "development-tools"
