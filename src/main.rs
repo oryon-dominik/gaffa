@@ -618,8 +618,42 @@ impl ProcessManager {
             children.keys().cloned().collect()
         };
 
+        // Stop processes sequentially but with timeout per process
         for name in process_names {
-            let _ = self.stop_process_with_state(&name, app_state.clone()).await;
+            // Use timeout to prevent hanging on stubborn processes
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                self.stop_process_with_state(&name, app_state.clone())
+            ).await;
+        }
+
+        // Force cleanup any remaining processes
+        let remaining: Vec<(String, Child)> = {
+            let mut children = self.children.lock().await;
+            children.drain().collect()
+        };
+
+        for (name, child) in remaining {
+            // Force kill without waiting
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(pid) = child.id() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .output();
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = child.kill().await;
+            }
+            
+            // Update process status
+            let mut processes = self.processes.lock().await;
+            if let Some(info) = processes.get_mut(&name) {
+                info.status = ProcessStatus::Stopped;
+                info.exit_code = Some(-1);
+            }
         }
 
         // Log to UI if available
@@ -1058,9 +1092,49 @@ async fn run_non_interactive(
     processes_to_start: Vec<String>,
     log_file_path: Option<String>,
 ) -> Result<()> {
-    // Give time for any previous signal handlers to clean up
-    // This helps when switching from interactive to non-interactive mode
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Setup signal handling BEFORE starting any processes
+    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag_ctrl_c = Arc::clone(&shutdown_flag);
+    
+    // Install global panic handler to ensure cleanup
+    let shutdown_flag_panic = Arc::clone(&shutdown_flag);
+    let manager_panic = Arc::clone(&manager);
+    let original_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        shutdown_flag_panic.store(true, std::sync::atomic::Ordering::SeqCst);
+        let manager_panic = Arc::clone(&manager_panic);
+        tokio::spawn(async move {
+            let _ = manager_panic.stop_all().await;
+        });
+        original_panic(info);
+    }));
+
+    // Setup Ctrl+C handler first, before starting processes
+    let ctrl_c_registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ctrl_c_registered_clone = Arc::clone(&ctrl_c_registered);
+    
+    // Register signal handler with immediate flag setting
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                // Immediately mark shutdown - don't rely on channels
+                shutdown_flag_ctrl_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                ctrl_c_registered_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                
+                // Force flush to ensure message is visible
+                println!("\n[{}] Interrupt received, stopping processes...", "gaffa".magenta());
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Err(e) => {
+                eprintln!("[{}] Failed to setup Ctrl+C handler: {}", "ERROR".red(), e);
+            }
+        }
+    });
+    
+    // Ensure signal handler is ready
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    
     // Setup log file if requested
     let log_file = if let Some(path) = &log_file_path {
         match std::fs::OpenOptions::new()
@@ -1109,51 +1183,8 @@ async fn run_non_interactive(
         .ok();
     }
 
-    // Setup signal handling with unbounded channel to avoid drops
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let shutdown_tx_ctrl_c = shutdown_tx.clone();
-
-    // Use a shared flag for more reliable shutdown detection
-    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_flag_ctrl_c = Arc::clone(&shutdown_flag);
-
-    // Set up Ctrl+C handler using tokio (works multiple times)
-    // On Windows, ensure we reset console mode for proper signal handling
-    #[cfg(target_os = "windows")]
-    {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-    }
-
-    let ctrl_c_handle = tokio::spawn(async move {
-        // Use a fresh signal stream to avoid conflicts
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                // Set the flag immediately
-                shutdown_flag_ctrl_c.store(true, std::sync::atomic::Ordering::SeqCst);
-
-                println!(
-                    "\n[{}] Interrupt received, stopping processes...",
-                    "gaffa".magenta()
-                );
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-
-                // Try to send through channel as well
-                let _ = shutdown_tx_ctrl_c.send(());
-            }
-            Err(e) => {
-                eprintln!("[{}] Failed to setup Ctrl+C handler: {}", "ERROR".red(), e);
-            }
-        }
-    });
-
-    // Ensure signal handler is set up before continuing
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Spawn stdin reader for 'q' command
-    let shutdown_tx_stdin = shutdown_tx.clone();
+    // Spawn stdin reader for 'q' command with shutdown flag
+    let shutdown_flag_stdin = Arc::clone(&shutdown_flag);
     let stdin_handle = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut reader = tokio::io::BufReader::new(stdin);
@@ -1161,74 +1192,95 @@ async fn run_non_interactive(
 
         loop {
             line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                reader.read_line(&mut line)
+            ).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(_)) => {
                     let input = line.trim();
                     if input == "q" || input == "quit" {
-                        println!(
-                            "\n[{}] Quit command received, stopping processes...",
-                            "gaffa".magenta()
-                        );
-                        let _ = shutdown_tx_stdin.send(());
+                        println!("\n[{}] Quit command received, stopping processes...", "gaffa".magenta());
+                        shutdown_flag_stdin.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                 }
-                Err(_) => break,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    // Timeout - check if we should exit
+                    if shutdown_flag_stdin.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    // Wait for all processes to exit or shutdown signal
-    let mut shutdown_received = false;
+    // Main event loop with improved shutdown handling
+    let mut shutdown_initiated = false;
+    let mut force_shutdown_deadline = None;
+    
     loop {
-        // Check the atomic flag first for immediate response
-        if shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) && !shutdown_received {
+        // Check shutdown flag with immediate response
+        if shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) && !shutdown_initiated {
+            shutdown_initiated = true;
+            force_shutdown_deadline = Some(Instant::now() + Duration::from_secs(5));
+            
+            // Initiate graceful shutdown
             manager.stop_all().await;
-            shutdown_received = true;
         }
 
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                if !shutdown_received {
-                    manager.stop_all().await;
-                    shutdown_received = true;
+        // Force termination if deadline exceeded
+        if let Some(deadline) = force_shutdown_deadline {
+            if Instant::now() > deadline {
+                eprintln!("\n[{}] Force terminating stubborn processes...", "ERROR".red());
+                
+                // Force kill all remaining processes
+                let children: Vec<String> = {
+                    let children = manager.children.lock().await;
+                    children.keys().cloned().collect()
+                };
+                
+                for name in children {
+                    if let Some(child) = manager.children.lock().await.remove(&name) {
+                        // Force kill without grace period
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Some(pid) = child.id() {
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                                    .output();
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let _ = child.kill().await;
+                        }
+                    }
                 }
-                // Don't break immediately, let the next iteration handle it
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => {
-                // Check flag again in case signal was missed
-                if shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) && !shutdown_received {
-                    manager.stop_all().await;
-                    shutdown_received = true;
-                }
-
-                let processes = manager.processes.lock().await;
-                let all_stopped = processes.values().all(|info| {
-                    info.status == ProcessStatus::Stopped
-                });
-                drop(processes);
-
-                if all_stopped {
-                    break;
-                }
-
-                // If shutdown was received and we've waited a bit, break anyway
-                if shutdown_received {
-                    // Give processes a moment to stop gracefully
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    break;
-                }
+                break;
             }
         }
+
+        // Check process status
+        let all_stopped = {
+            let processes = manager.processes.lock().await;
+            processes.values().all(|info| info.status == ProcessStatus::Stopped)
+        };
+
+        if all_stopped && shutdown_initiated {
+            break;
+        }
+
+        // Small sleep to prevent busy waiting
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Cancel only the stdin reader task to prevent hanging
-    // Don't abort ctrl_c_handle as it should remain active until the process exits
+    // Cleanup
     stdin_handle.abort();
-
-    // Ensure ctrl_c_handle doesn't get dropped
-    drop(ctrl_c_handle);
+    
+    // Restore panic handler
+    let _ = std::panic::take_hook();
 
     // Show final summary
     manager.show_final_summary().await;
