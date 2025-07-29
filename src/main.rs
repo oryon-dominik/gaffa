@@ -445,6 +445,12 @@ impl ProcessManager {
             let mut lines = stdout_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim_end().to_string(); // Remove any trailing whitespace/newlines
+                
+                // Skip empty lines to avoid clutter
+                if line.is_empty() {
+                    continue;
+                }
+                
                 if let Some(state) = &app_state_stdout {
                     state.add_log(name_str.clone(), line.clone(), false).await;
                 } else {
@@ -473,6 +479,12 @@ impl ProcessManager {
             let mut lines = stderr_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim_end().to_string(); // Remove any trailing whitespace/newlines
+                
+                // Skip empty lines to avoid clutter
+                if line.is_empty() {
+                    continue;
+                }
+                
                 if let Some(state) = &app_state_stderr {
                     state.add_log(name_str.clone(), line.clone(), true).await;
                 } else {
@@ -513,6 +525,16 @@ impl ProcessManager {
         name: &str,
         app_state: Option<Arc<AppState>>,
     ) -> Result<()> {
+        // First announce we're stopping the process
+        if let Some(state) = &app_state {
+            state
+                .add_system_log(format!("Stopping process '{name}'..."))
+                .await;
+        } else {
+            self.print_system_message(&format!("Stopping process '{name}'..."))
+                .await;
+        }
+        
         let mut children = self.children.lock().await;
 
         if let Some(mut child) = children.remove(name) {
@@ -1119,6 +1141,7 @@ async fn run_non_interactive(
     manager: Arc<ProcessManager>,
     processes_to_start: Vec<String>,
     log_file_path: Option<String>,
+    procfile_path: &str,
 ) -> Result<()> {
     // Setup signal handling BEFORE starting any processes
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1186,7 +1209,7 @@ async fn run_non_interactive(
 
     // Start all requested processes
     manager
-        .print_system_message(&format!("Starting {} processes", processes_to_start.len()))
+        .print_system_message(&format!("Loading {} processes from {}", processes_to_start.len(), procfile_path))
         .await;
     manager
         .print_system_message("Press Ctrl+C to stop all processes")
@@ -1418,7 +1441,7 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
         result
     } else {
         // Run in non-interactive mode (default)
-        run_non_interactive(manager, processes_to_start, log_file_path).await
+        run_non_interactive(manager, processes_to_start, log_file_path, procfile_path).await
     }
 }
 

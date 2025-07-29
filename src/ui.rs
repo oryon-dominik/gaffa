@@ -327,12 +327,6 @@ pub async fn run_terminal_ui(
     let manager_for_startup = Arc::clone(&manager);
     let procfile_path_owned = procfile_path.to_string();
     tokio::spawn(async move {
-        // Log initial banner
-        state_for_startup.add_system_log("─".repeat(60)).await;
-        state_for_startup
-            .add_system_log("GAFFA Process Manager".to_string())
-            .await;
-        state_for_startup.add_system_log("─".repeat(60)).await;
         state_for_startup
             .add_system_log(format!(
                 "Loading {} processes from {}",
@@ -411,7 +405,6 @@ pub async fn run_terminal_ui(
 #[allow(clippy::needless_pass_by_value)]
 // Terminal cleanup function that MUST be called
 fn cleanup_terminal() {
-    use crossterm::terminal;
     use std::io::Write;
     
     // Disable raw mode first
@@ -422,8 +415,7 @@ fn cleanup_terminal() {
     let _ = execute!(
         stdout,
         LeaveAlternateScreen,
-        DisableMouseCapture,
-        terminal::Clear(terminal::ClearType::All)
+        DisableMouseCapture
     );
     
     // Force a flush to ensure all changes are applied
@@ -934,15 +926,21 @@ fn render_process_status(f: &mut Frame, area: Rect, ui_state: &UIState) {
             let uptime = parts[3].trim();
 
             // Choose color based on status
-            let (status_color, name_color) = if status.contains("Running") {
-                (Color::Green, Color::Cyan)
+            let status_color = if status.contains("Running") {
+                Color::Green
             } else if status.contains("Stopped") {
-                (Color::Yellow, Color::Gray)
+                Color::Yellow
             } else if status.contains("Restarting") {
-                (Color::Blue, Color::Blue)
+                Color::Blue
             } else {
-                (Color::White, Color::White)
+                Color::White
             };
+            
+            // Get the actual process color from the map
+            let name_color = ui_state.process_colors
+                .get(name)
+                .copied()
+                .unwrap_or(Color::Cyan);
 
             lines.push(Line::from(vec![
                 Span::styled(format!("{name:>12}"), Style::default().fg(name_color)),
