@@ -436,6 +436,7 @@ impl ProcessManager {
                         if let Some(state) = &app_state_monitor {
                             let exit_msg = match exit_code {
                                 Some(0) => format!("Process '{name_str}' exited cleanly"),
+                                Some(-1) => format!("Process '{name_str}' terminated gracefully"), // Force terminated
                                 Some(512) => format!("Process '{name_str}' interrupted gracefully"), // KeyboardInterrupt
                                 Some(-1073741510) => format!("Process '{name_str}' interrupted gracefully"), // CTRL_C_EVENT on Windows
                                 Some(code) => {
@@ -1535,6 +1536,7 @@ async fn show_termination_summary(manager: &ProcessManager) {
         let status_str = match (&info.status, info.exit_code) {
             (ProcessStatus::Running, _) => "running".to_string(),
             (ProcessStatus::Stopped, Some(0)) => "exit 0".to_string(),
+            (ProcessStatus::Stopped, Some(-1)) => "terminated".to_string(), // Force terminated  
             (ProcessStatus::Stopped, Some(512)) => "interrupted".to_string(), // KeyboardInterrupt
             (ProcessStatus::Stopped, Some(-1073741510)) => "interrupted".to_string(), // CTRL_C_EVENT
             (ProcessStatus::Stopped, Some(code)) => format!("exit {code}"),
