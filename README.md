@@ -17,10 +17,10 @@ circus. Whatever you like. 🧙‍♀️
 
 ## Features
 
-
 - **Cross-platform**: Works on Windows, macOS, and Linux without tmux dependency
 - **Process Management**: Start, stop, and restart processes individually in interactive mode
 - **Live Monitoring**: Process status, uptime, and restart counts
+- **Interactive Mode**: Terminal UI with keyboard shortcuts and mouse scrolling
 
 
 ## Installation
@@ -56,4 +56,16 @@ gaffa run --log-file log.txt
 
 # Custom Procfile
 gaffa run --procfile custom.procfile
+
+# Set environment variables
+gaffa run --env PORT=8000 --env PYTHONUNBUFFERED=1
+
+# Load environment from file
+gaffa run --env-file .env
 ```
+
+## Output Buffering
+
+Some processes buffer their output when not connected to a terminal. To see real-time output:
+
+- **Python**: Set `PYTHONUNBUFFERED=1` environment variable

@@ -173,6 +173,7 @@ pub async fn run_terminal_ui(
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UICommand>();
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     let (status_tx, status_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel::<()>();
 
     // Update the app state's channels
     {
@@ -316,7 +317,7 @@ pub async fn run_terminal_ui(
     let logs_clone = Arc::clone(&state.logs);
     let manager_for_ui = Arc::clone(&manager);
     let ui_result = tokio::task::spawn_blocking(move || {
-        run_ui_loop(ui_tx, logs_clone, status_rx, manager_for_ui)
+        run_ui_loop(ui_tx, logs_clone, status_rx, shutdown_rx, manager_for_ui)
     });
 
     // Give the UI a moment to initialize
@@ -373,9 +374,71 @@ pub async fn run_terminal_ui(
                     }
                 }
                 UICommand::Quit => {
+                    state_for_commands
+                        .add_system_log("Stopping all processes...".to_string())
+                        .await;
                     manager_for_commands
                         .stop_all_with_state(Some(state_for_commands.clone()))
                         .await;
+                    
+                    // Fix any processes that were terminated but status wasn't updated
+                    {
+                        let mut processes = manager_for_commands.processes.lock().await;
+                        let children = manager_for_commands.children.lock().await;
+                        for (name, info) in processes.iter_mut() {
+                            if info.status == crate::ProcessStatus::Running && !children.contains_key(name) {
+                                // Process is marked as running but has no child - it must have been terminated
+                                info.status = crate::ProcessStatus::Stopped;
+                                info.stopped_at = Some(std::time::Instant::now());
+                            }
+                        }
+                        
+                    }
+                    
+                    // Wait for all processes to actually stop
+                    let timeout = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let all_stopped = {
+                            let processes = manager_for_commands.processes.lock().await;
+                            // Only check processes that were actually running (not those that were never started)
+                            let running_processes: Vec<_> = processes.values()
+                                .filter(|info| info.last_restart.is_some()) // Only processes that were started
+                                .collect();
+                            
+                            let all_stopped = running_processes.iter().all(|info| info.status == crate::ProcessStatus::Stopped);
+                            
+                            
+                            all_stopped
+                        };
+                        
+                        if all_stopped {
+                            state_for_commands
+                                .add_system_log("All processes stopped. Exiting...".to_string())
+                                .await;
+                            // Give UI time to show the message
+                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                            // Send one final message to signal complete shutdown
+                            state_for_commands
+                                .add_system_log("Shutdown complete.".to_string())
+                                .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            // Signal UI to exit
+                            let _ = shutdown_tx.send(());
+                            break; // Exit immediately after showing messages
+                        }
+                        
+                        if std::time::Instant::now() > timeout {
+                            state_for_commands
+                                .add_system_log("Timeout waiting for processes to stop. Forcing exit...".to_string())
+                                .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            // Signal UI to exit even on timeout
+                            let _ = shutdown_tx.send(());
+                            break;
+                        }
+                        
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                     break;
                 }
             }
@@ -445,6 +508,7 @@ fn run_ui_loop(
     tx: mpsc::UnboundedSender<UICommand>,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
     status_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    shutdown_rx: mpsc::UnboundedReceiver<()>,
     manager: Arc<ProcessManager>,
 ) -> Result<(), ProcessError> {
     // Set panic handler to cleanup terminal
@@ -485,6 +549,7 @@ fn run_ui_loop(
         tx,
         logs.clone(),
         status_rx,
+        shutdown_rx,
         manager,
     );
 
@@ -506,6 +571,7 @@ fn run_app<B: Backend>(
     tx: mpsc::UnboundedSender<UICommand>,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
     mut status_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    mut shutdown_rx: mpsc::UnboundedReceiver<()>,
     manager: Arc<ProcessManager>,
 ) -> Result<(), ProcessError> {
     let mut needs_redraw = true;
@@ -518,8 +584,9 @@ fn run_app<B: Backend>(
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            ui_state.should_quit = true;
                             let _ = tx.send(UICommand::Quit);
-                            return Ok(());
+                            // Don't return immediately - let the command handler finish
                         }
                         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Paste from clipboard
@@ -761,9 +828,16 @@ fn run_app<B: Backend>(
             should_redraw = true;
         }
 
-        // If quitting, exit immediately
-        if ui_state.should_quit {
+        // Check for shutdown signal
+        if let Ok(()) = shutdown_rx.try_recv() {
             break Ok(());
+        }
+
+        // If quitting, just continue showing UI until command handler finishes
+        if ui_state.should_quit {
+            // The command handler is taking care of waiting for processes to stop
+            // Add a small delay to avoid busy-waiting and let other tasks run
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
             // Force redraw for time updates when status is visible
