@@ -4,11 +4,11 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
-use colored::Colorize;
+
 use crossterm::{
-    event::{self, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
-    terminal::{EnterAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
@@ -97,6 +97,7 @@ impl Default for AppState {
 struct UIState {
     logs: VecDeque<LogEntry>,
     input: String,
+    cursor_position: usize,                 // Track cursor position within input
     command_history: Vec<String>,
     history_index: Option<usize>,
     process_status: Vec<String>,
@@ -112,6 +113,7 @@ impl UIState {
         Self {
             logs: VecDeque::new(),
             input: String::new(),
+            cursor_position: 0,
             command_history: Vec::new(),
             history_index: None,
             process_status: Vec::new(),
@@ -347,7 +349,7 @@ pub async fn run_terminal_ui(
             {
                 Ok(()) => {
                     state_for_startup
-                        .add_system_log(format!("Started process '{process_name}'"))
+                        .add_system_log(format!("Starting process '{process_name}'"))
                         .await;
                 }
                 Err(e) => {
@@ -396,124 +398,12 @@ pub async fn run_terminal_ui(
         }
     };
 
-    // Give time for final shutdown logs to be collected
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     // Clean up
     status_handle.abort();
     log_handle.abort();
 
-    // The UI has already finished by now since we're past the tokio::select!
-    // result contains the UI cleanup result
-
-    // Add a small delay to ensure terminal is fully restored
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    // Extra cleanup to ensure terminal is in good state
-    // This is critical for Windows where terminal state can persist
+    // Cleanup terminal immediately
     cleanup_terminal();
-
-    // Now show shutdown summary in the original terminal
-    println!("\n{}", "gaffa: session terminated".magenta());
-    println!();
-
-    // Get process information from manager
-    let processes = manager.processes.lock().await;
-
-    // Create a sorted list for consistent color assignment
-    let mut process_list: Vec<_> = processes.iter().collect();
-    process_list.sort_by_key(|(name, _)| name.as_str());
-
-    for (index, (name, info)) in process_list.iter().enumerate() {
-        // Calculate total runtime including current session if running
-        let total_runtime = if info.status == crate::ProcessStatus::Running {
-            if let Some(start_time) = info.last_restart {
-                info.cumulative_runtime + start_time.elapsed()
-            } else {
-                info.cumulative_runtime
-            }
-        } else {
-            info.cumulative_runtime
-        };
-
-        let runtime_str = if total_runtime.as_secs() == 0 {
-            "N/A".to_string()
-        } else {
-            let secs = total_runtime.as_secs();
-            let total_formatted = if secs >= 3600 {
-                format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-            } else if secs >= 60 {
-                format!("{}m{}s", secs / 60, secs % 60)
-            } else {
-                format!("{secs}s")
-            };
-
-            // Show current session time, with total in brackets if different
-            if info.status == crate::ProcessStatus::Running {
-                if let Some(start_time) = info.last_restart {
-                    let session_secs = start_time.elapsed().as_secs();
-                    let session_formatted = if session_secs >= 3600 {
-                        format!("{}h{}m", session_secs / 3600, (session_secs % 3600) / 60)
-                    } else if session_secs >= 60 {
-                        format!("{}m{}s", session_secs / 60, session_secs % 60)
-                    } else {
-                        format!("{session_secs}s")
-                    };
-                    // Show total in brackets if different from session
-                    if total_runtime.as_secs() != session_secs {
-                        format!("{session_formatted} ({total_formatted})")
-                    } else {
-                        session_formatted
-                    }
-                } else {
-                    total_formatted
-                }
-            } else {
-                // For stopped processes, just show total
-                total_formatted
-            }
-        };
-
-        let restart_info = match info.restart_count {
-            0 => String::new(),
-            1 => " [1 restart]".to_string(),
-            n => format!(" [{n} restarts]"),
-        };
-
-        let status_str = match (&info.status, info.exit_code) {
-            (crate::ProcessStatus::Running, _) => "running".to_string(),
-            (crate::ProcessStatus::Stopped, Some(0)) => "exit 0".to_string(),
-            (crate::ProcessStatus::Stopped, Some(code)) => format!("exit {code}"),
-            (crate::ProcessStatus::Stopped, None) => "stopped".to_string(),
-            (crate::ProcessStatus::Restarting, _) => "restarting".to_string(),
-        };
-
-        // Get the color for this process based on index
-        // Convert from ratatui colors to colored crate colors (matching main.rs)
-        let colored_name = match PROCESS_COLORS[index % PROCESS_COLORS.len()] {
-            Color::Cyan => name.cyan(),
-            Color::Yellow => name.yellow(),
-            Color::Blue => name.blue(),
-            Color::Green => name.green(),
-            Color::LightCyan => name.bright_cyan(),
-            Color::LightYellow => name.bright_yellow(),
-            Color::LightBlue => name.bright_blue(),
-            _ => name.white(),
-        };
-
-        println!(
-            "{:>12}  {:>12}  {:>12}{}",
-            colored_name, status_str, runtime_str, restart_info
-        );
-    }
-
-    println!();
-
-    // Ensure all output is flushed
-    {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    }
 
     Ok(())
 }
@@ -521,28 +411,12 @@ pub async fn run_terminal_ui(
 #[allow(clippy::needless_pass_by_value)]
 // Terminal cleanup function that MUST be called
 fn cleanup_terminal() {
-    use std::io::Write;
-
-    // First, try to disable raw mode
+    // Disable raw mode first
     let _ = disable_raw_mode();
-
-    // Reset terminal completely
+    
+    // Then leave alternate screen and disable mouse
     let mut stdout = std::io::stdout();
-
-    // Send reset sequences directly
-    let _ = stdout.write_all(b"\x1b[?1049l"); // Exit alternate screen
-    let _ = stdout.write_all(b"\x1b[?1000l"); // Disable mouse
-    let _ = stdout.write_all(b"\x1b[?25h"); // Show cursor
-    let _ = stdout.write_all(b"\x1b[0m"); // Reset colors
-    let _ = stdout.flush();
-
-    // On Windows, also reset console mode
-    #[cfg(target_os = "windows")]
-    {
-        use crossterm::terminal::disable_raw_mode;
-        // Double-check raw mode is disabled
-        let _ = disable_raw_mode();
-    }
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
 }
 
 fn run_ui_loop(
@@ -551,9 +425,11 @@ fn run_ui_loop(
     status_rx: mpsc::UnboundedReceiver<Vec<String>>,
     manager: Arc<ProcessManager>,
 ) -> Result<(), ProcessError> {
-    // Set up panic handler to clean up terminal
-    std::panic::set_hook(Box::new(|_panic_info| {
-        cleanup_terminal();
+    // Set panic handler to cleanup terminal
+    std::panic::set_hook(Box::new(|_| {
+        let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
     }));
 
     // Setup terminal
@@ -611,6 +487,178 @@ fn run_app<B: Backend>(
     let mut last_redraw = std::time::Instant::now();
 
     loop {
+        // Always try to process events first
+        while event::poll(std::time::Duration::from_millis(0)).map_err(ProcessError::InputRead)? {
+            match event::read().map_err(ProcessError::InputRead)? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let _ = tx.send(UICommand::Quit);
+                            return Ok(());
+                        }
+                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Paste from clipboard
+                            if let Ok(text) = cli_clipboard::get_contents() {
+                                ui_state.input.push_str(&text);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('t') if ui_state.input.is_empty() => {
+                            // Toggle status window when 't' is pressed with empty input
+                            ui_state.show_status = !ui_state.show_status;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char(c) => {
+                            let pos = ui_state.cursor_position;
+                            ui_state.input.insert(pos, c);
+                            ui_state.cursor_position += 1;
+                            needs_redraw = true;
+                        }
+                        KeyCode::Backspace => {
+                            if ui_state.cursor_position > 0 {
+                                ui_state.cursor_position -= 1;
+                                ui_state.input.remove(ui_state.cursor_position);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if ui_state.cursor_position < ui_state.input.len() {
+                                ui_state.input.remove(ui_state.cursor_position);
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let input = ui_state.input.trim().to_string();
+                            if !input.is_empty() {
+                                ui_state.command_history.push(input.clone());
+                                ui_state.history_index = None;
+
+                                if input == "q" || input == "quit" {
+                                    ui_state.should_quit = true;
+                                    let _ = tx.send(UICommand::Quit);
+                                    // Don't return immediately - let the UI show teardown messages
+                                } else {
+                                    let _ = tx.send(UICommand::ExecuteCommand(input));
+                                }
+
+                                ui_state.input.clear();
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Left => {
+                            if ui_state.cursor_position > 0 {
+                                ui_state.cursor_position -= 1;
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Right => {
+                            if ui_state.cursor_position < ui_state.input.len() {
+                                ui_state.cursor_position += 1;
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Home if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Move cursor to beginning of input
+                            ui_state.cursor_position = 0;
+                            needs_redraw = true;
+                        }
+                        KeyCode::End if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Move cursor to end of input
+                            ui_state.cursor_position = ui_state.input.len();
+                            needs_redraw = true;
+                        }
+                        KeyCode::Up => {
+                            if !ui_state.command_history.is_empty() {
+                                match ui_state.history_index {
+                                    None => {
+                                        ui_state.history_index =
+                                            Some(ui_state.command_history.len() - 1);
+                                        ui_state.input = ui_state.command_history
+                                            [ui_state.command_history.len() - 1]
+                                            .clone();
+                                        needs_redraw = true;
+                                    }
+                                    Some(idx) if idx > 0 => {
+                                        ui_state.history_index = Some(idx - 1);
+                                        ui_state.input = ui_state.command_history[idx - 1].clone();
+                                        needs_redraw = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        KeyCode::Down => match ui_state.history_index {
+                            Some(idx) if idx < ui_state.command_history.len() - 1 => {
+                                ui_state.history_index = Some(idx + 1);
+                                ui_state.input = ui_state.command_history[idx + 1].clone();
+                                needs_redraw = true;
+                            }
+                            Some(_) => {
+                                ui_state.history_index = None;
+                                ui_state.input.clear();
+                                ui_state.cursor_position = 0;
+                                needs_redraw = true;
+                            }
+                            _ => {}
+                        },
+                        KeyCode::PageUp => {
+                            // Scroll up by one page
+                            let page_size = 10;
+                            ui_state.log_scroll_offset =
+                                ui_state.log_scroll_offset.saturating_add(page_size);
+                            // Cap at maximum
+                            let max_scroll = ui_state.logs.len().saturating_sub(5);
+                            if ui_state.log_scroll_offset > max_scroll {
+                                ui_state.log_scroll_offset = max_scroll;
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::PageDown => {
+                            // Scroll down by one page
+                            let page_size = 10;
+                            ui_state.log_scroll_offset =
+                                ui_state.log_scroll_offset.saturating_sub(page_size);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Jump to beginning of logs
+                            let max_scroll = ui_state.logs.len().saturating_sub(5);
+                            ui_state.log_scroll_offset = max_scroll;
+                            needs_redraw = true;
+                        }
+                        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Jump to end of logs (latest)
+                            ui_state.log_scroll_offset = 0;
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            ui_state.log_scroll_offset =
+                                ui_state.log_scroll_offset.saturating_add(8);
+                            let max_scroll = ui_state.logs.len().saturating_sub(5);
+                            if ui_state.log_scroll_offset > max_scroll {
+                                ui_state.log_scroll_offset = max_scroll;
+                            }
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            ui_state.log_scroll_offset =
+                                ui_state.log_scroll_offset.saturating_sub(8);
+                            needs_redraw = true;
+                        }
+                        _ => {
+                            // Ignore other mouse events to allow text selection
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
         let mut should_redraw = false;
 
         // Update UI state with latest logs
@@ -685,28 +733,12 @@ fn run_app<B: Backend>(
             should_redraw = true;
         }
 
-        // If quitting, wait for all stop messages
+        // If quitting, exit immediately
         if ui_state.should_quit {
-            // Check if we've seen all "stopped" messages or waited long enough
-            let stopped_count = ui_state
-                .logs
-                .iter()
-                .rev() // Search from newest logs first
-                .take(20) // Only check recent logs
-                .filter(|log| {
-                    log.content.contains("✓ Stopped process")
-                        || log.content.contains("All processes stopped")
-                })
-                .count();
-
-            // We expect at least one stop message per process, plus the "All processes stopped" message
-            if stopped_count > 0 || ui_state.logs.len() > ui_state.last_log_count + 5 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                break Ok(());
-            }
+            break Ok(());
         }
 
-        // Force redraw for time updates when status is visible
+            // Force redraw for time updates when status is visible
         if ui_state.show_status && last_redraw.elapsed() > std::time::Duration::from_millis(100) {
             should_redraw = true;
         }
@@ -720,149 +752,8 @@ fn run_app<B: Backend>(
             last_redraw = std::time::Instant::now();
         }
 
-        // Use shorter poll time when UI needs updates, longer when idle
-        let poll_timeout = if should_redraw || needs_redraw {
-            std::time::Duration::from_millis(1)
-        } else {
-            std::time::Duration::from_millis(16)
-        };
-
-        if event::poll(poll_timeout).map_err(ProcessError::InputRead)? {
-            match event::read().map_err(ProcessError::InputRead)? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let _ = tx.send(UICommand::Quit);
-                            return Ok(());
-                        }
-                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Paste from clipboard
-                            if let Ok(text) = cli_clipboard::get_contents() {
-                                ui_state.input.push_str(&text);
-                                needs_redraw = true;
-                            }
-                        }
-                        KeyCode::Char('t') if ui_state.input.is_empty() => {
-                            // Toggle status window when 't' is pressed with empty input
-                            ui_state.show_status = !ui_state.show_status;
-                            needs_redraw = true;
-                        }
-                        KeyCode::Char(c) => {
-                            ui_state.input.push(c);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Backspace => {
-                            ui_state.input.pop();
-                            needs_redraw = true;
-                        }
-                        KeyCode::Enter => {
-                            let input = ui_state.input.trim().to_string();
-                            if !input.is_empty() {
-                                ui_state.command_history.push(input.clone());
-                                ui_state.history_index = None;
-
-                                if input == "q" || input == "quit" {
-                                    ui_state.should_quit = true;
-                                    let _ = tx.send(UICommand::Quit);
-                                    // Don't return immediately - let the UI show teardown messages
-                                } else {
-                                    let _ = tx.send(UICommand::ExecuteCommand(input));
-                                }
-
-                                ui_state.input.clear();
-                                needs_redraw = true;
-                            }
-                        }
-                        KeyCode::Up => {
-                            if !ui_state.command_history.is_empty() {
-                                match ui_state.history_index {
-                                    None => {
-                                        ui_state.history_index =
-                                            Some(ui_state.command_history.len() - 1);
-                                        ui_state.input = ui_state.command_history
-                                            [ui_state.command_history.len() - 1]
-                                            .clone();
-                                        needs_redraw = true;
-                                    }
-                                    Some(idx) if idx > 0 => {
-                                        ui_state.history_index = Some(idx - 1);
-                                        ui_state.input = ui_state.command_history[idx - 1].clone();
-                                        needs_redraw = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        KeyCode::Down => match ui_state.history_index {
-                            Some(idx) if idx < ui_state.command_history.len() - 1 => {
-                                ui_state.history_index = Some(idx + 1);
-                                ui_state.input = ui_state.command_history[idx + 1].clone();
-                                needs_redraw = true;
-                            }
-                            Some(_) => {
-                                ui_state.history_index = None;
-                                ui_state.input.clear();
-                                needs_redraw = true;
-                            }
-                            _ => {}
-                        },
-                        KeyCode::PageUp => {
-                            // Scroll up by one page
-                            let page_size = 10;
-                            ui_state.log_scroll_offset =
-                                ui_state.log_scroll_offset.saturating_add(page_size);
-                            // Cap at maximum
-                            let max_scroll = ui_state.logs.len().saturating_sub(5);
-                            if ui_state.log_scroll_offset > max_scroll {
-                                ui_state.log_scroll_offset = max_scroll;
-                            }
-                            needs_redraw = true;
-                        }
-                        KeyCode::PageDown => {
-                            // Scroll down by one page
-                            let page_size = 10;
-                            ui_state.log_scroll_offset =
-                                ui_state.log_scroll_offset.saturating_sub(page_size);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Home => {
-                            // Jump to beginning
-                            let max_scroll = ui_state.logs.len().saturating_sub(5);
-                            ui_state.log_scroll_offset = max_scroll;
-                            needs_redraw = true;
-                        }
-                        KeyCode::End => {
-                            // Jump to end (latest logs)
-                            ui_state.log_scroll_offset = 0;
-                            needs_redraw = true;
-                        }
-                        _ => {}
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            ui_state.log_scroll_offset =
-                                ui_state.log_scroll_offset.saturating_add(8);
-                            let max_scroll = ui_state.logs.len().saturating_sub(5);
-                            if ui_state.log_scroll_offset > max_scroll {
-                                ui_state.log_scroll_offset = max_scroll;
-                            }
-                            needs_redraw = true;
-                        }
-                        MouseEventKind::ScrollDown => {
-                            ui_state.log_scroll_offset =
-                                ui_state.log_scroll_offset.saturating_sub(8);
-                            needs_redraw = true;
-                        }
-                        _ => {
-                            // Ignore other mouse events to allow text selection
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Add a small sleep to prevent CPU spinning
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -1026,9 +917,9 @@ fn render_input_with_help(f: &mut Frame, area: Rect, ui_state: &UIState) {
 
     f.render_widget(input, area);
 
-    // Show cursor
+    // Show cursor at the correct position
     f.set_cursor_position((
-        area.x + u16::try_from(ui_state.input.len()).unwrap_or(0) + 1,
+        area.x + u16::try_from(ui_state.cursor_position).unwrap_or(0) + 1,
         area.y + 1,
     ));
 }
