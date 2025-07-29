@@ -411,12 +411,42 @@ pub async fn run_terminal_ui(
 #[allow(clippy::needless_pass_by_value)]
 // Terminal cleanup function that MUST be called
 fn cleanup_terminal() {
+    use crossterm::terminal;
+    use std::io::Write;
+    
     // Disable raw mode first
     let _ = disable_raw_mode();
     
     // Then leave alternate screen and disable mouse
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        terminal::Clear(terminal::ClearType::All)
+    );
+    
+    // Force a flush to ensure all changes are applied
+    let _ = stdout.flush();
+    
+    // Reset terminal to ensure it's in a good state
+    #[cfg(windows)]
+    {
+        // On Windows, reset console input mode to allow Ctrl+C
+        use winapi::um::consoleapi::SetConsoleMode;
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::STD_INPUT_HANDLE;
+        use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
+        
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            if handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                // Restore normal console mode with Ctrl+C handling
+                let mode = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
+                SetConsoleMode(handle, mode);
+            }
+        }
+    }
 }
 
 fn run_ui_loop(
@@ -426,10 +456,10 @@ fn run_ui_loop(
     manager: Arc<ProcessManager>,
 ) -> Result<(), ProcessError> {
     // Set panic handler to cleanup terminal
-    std::panic::set_hook(Box::new(|_| {
-        let _ = disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+    let original_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        cleanup_terminal();
+        original_panic(info);
     }));
 
     // Setup terminal
@@ -470,6 +500,9 @@ fn run_ui_loop(
 
     // Always restore terminal, even on error
     cleanup_terminal();
+    
+    // Restore original panic handler
+    let _ = std::panic::take_hook();
 
     res
 }
@@ -487,7 +520,7 @@ fn run_app<B: Backend>(
     let mut last_redraw = std::time::Instant::now();
 
     loop {
-        // Always try to process events first
+        // Process all available events without blocking
         while event::poll(std::time::Duration::from_millis(0)).map_err(ProcessError::InputRead)? {
             match event::read().map_err(ProcessError::InputRead)? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -499,7 +532,9 @@ fn run_app<B: Backend>(
                         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Paste from clipboard
                             if let Ok(text) = cli_clipboard::get_contents() {
-                                ui_state.input.push_str(&text);
+                                let pos = ui_state.cursor_position;
+                                ui_state.input.insert_str(pos, &text);
+                                ui_state.cursor_position += text.len();
                                 needs_redraw = true;
                             }
                         }
@@ -542,6 +577,7 @@ fn run_app<B: Backend>(
                                 }
 
                                 ui_state.input.clear();
+                                ui_state.cursor_position = 0;
                                 needs_redraw = true;
                             }
                         }
@@ -831,19 +867,39 @@ fn render_logs(f: &mut Frame, area: Rect, ui_state: &mut UIState) {
         .skip(start_idx)
         .take(visible_height)
         .map(|entry| {
-            let style = if entry.process == "gaffa" {
-                // All gaffa messages use consistent magenta color
-                Style::default().fg(Color::Magenta)
+            use ratatui::text::{Line, Span};
+            
+            let process_color = if entry.process == "gaffa" {
+                Color::Magenta
             } else {
-                let color = process_colors
+                process_colors
                     .get(&entry.process)
                     .copied()
-                    .unwrap_or(Color::Green);
-                Style::default().fg(color)
+                    .unwrap_or(Color::Green)
             };
 
-            let content = format!("{:>12} | {}", entry.process, entry.content);
-            ListItem::new(content).style(style)
+            // Create a line with colored process name and appropriately colored content
+            let line = if entry.process == "gaffa" {
+                // For gaffa messages, color the entire line magenta
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>12} | {}", entry.process, entry.content),
+                        Style::default().fg(Color::Magenta)
+                    ),
+                ])
+            } else {
+                // For process output, only color the process name
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>12}", entry.process),
+                        Style::default().fg(process_color)
+                    ),
+                    Span::raw(" | "),
+                    Span::raw(&entry.content),
+                ])
+            };
+            
+            ListItem::new(line)
         })
         .collect();
 

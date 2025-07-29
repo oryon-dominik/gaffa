@@ -304,9 +304,17 @@ impl ProcessManager {
         let args = &command_parts[1..];
 
         let mut cmd = TokioCommand::new(program);
-        cmd.args(args)
-            .stdin(Stdio::inherit())  // Allow child processes to receive input
-            .stdout(Stdio::piped())
+        cmd.args(args);
+        
+        // Only inherit stdin in non-interactive mode
+        // In interactive mode (when app_state is Some), the TUI needs exclusive stdin access
+        if app_state.is_none() {
+            cmd.stdin(Stdio::inherit());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        
+        cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         // On Windows, create process in a new process group
@@ -436,13 +444,13 @@ impl ProcessManager {
         tokio::spawn(async move {
             let mut lines = stdout_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim_end().to_string(); // Remove any trailing whitespace/newlines
                 if let Some(state) = &app_state_stdout {
                     state.add_log(name_str.clone(), line.clone(), false).await;
                 } else {
                     let colored_name = name_str.color(process_color);
-                    let colored_line = line.color(process_color);
                     let padding = " ".repeat(max_name_len.saturating_sub(name_str.len()));
-                    println!("{colored_name}{padding} | {colored_line}");
+                    println!("{colored_name}{padding} | {}", line);
 
                     // Write to log file if available
                     if let Some(log_file) = &log_file_stdout {
@@ -464,13 +472,13 @@ impl ProcessManager {
         tokio::spawn(async move {
             let mut lines = stderr_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim_end().to_string(); // Remove any trailing whitespace/newlines
                 if let Some(state) = &app_state_stderr {
                     state.add_log(name_str.clone(), line.clone(), true).await;
                 } else {
                     let colored_name = name_str.color(process_color);
-                    let colored_line = line.color(process_color);
                     let padding = " ".repeat(max_name_len.saturating_sub(name_str.len()));
-                    println!("{colored_name}{padding} | {colored_line}");
+                    println!("{colored_name}{padding} | {}", line);
 
                     // Write to log file if available
                     if let Some(log_file) = &log_file {
@@ -525,7 +533,7 @@ impl ProcessManager {
             // Log to UI if available
             if let Some(state) = &app_state {
                 state
-                    .add_system_log(format!("Stopped process '{name}'\n"))
+                    .add_system_log(format!("Stopped process '{name}'"))
                     .await;
             } else {
                 self.print_system_message(&format!("Stopped process '{name}'"))
@@ -552,16 +560,18 @@ impl ProcessManager {
         #[cfg(target_os = "windows")]
         {
             if let Some(pid) = child.id() {
-                // On Windows, first try to send SIGINT (Ctrl+C) which Python handles well
-                // This requires the GenerateConsoleCtrlEvent Windows API
+                // On Windows, Python responds better to SIGBREAK (Ctrl+Break) than termination
+                // First, try sending SIGBREAK using Windows API
+                unsafe {
+                    use winapi::um::wincon::GenerateConsoleCtrlEvent;
+                    use winapi::um::wincon::CTRL_BREAK_EVENT;
+                    
+                    // This sends Ctrl+Break to the process group
+                    let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+                }
                 
-                // First attempt: Use taskkill without /F to send WM_CLOSE
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string()])
-                    .output();
-                
-                // Give plenty of time for graceful shutdown
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                // Give plenty of time for graceful Python shutdown
+                tokio::time::sleep(Duration::from_secs(5)).await;
 
                 // Check if process exited
                 if let Ok(Some(status)) = child.try_wait() {
@@ -634,8 +644,23 @@ impl ProcessManager {
         name: &str,
         app_state: Option<Arc<AppState>>,
     ) -> Result<()> {
+        // First announce the restart
+        if let Some(state) = &app_state {
+            state
+                .add_system_log(format!("Restarting process '{name}'..."))
+                .await;
+        } else {
+            self.print_system_message(&format!("Restarting process '{name}'..."))
+                .await;
+        }
+        
+        // Stop the process (this will show "Stopped process 'name'")
         let _ = self.stop_process_with_state(name, app_state.clone()).await;
+        
+        // Brief pause before restart
         sleep(Duration::from_millis(200)).await;
+        
+        // Start the process (this will show "Starting 'name'...")
         self.start_process_with_state(name, app_state).await
     }
 
@@ -646,9 +671,14 @@ impl ProcessManager {
 
     /// Stop all running processes with optional UI state.
     pub async fn stop_all_with_state(&self, app_state: Option<Arc<AppState>>) {
+        // Get all RUNNING processes, not just those with children
         let process_names: Vec<String> = {
-            let children = self.children.lock().await;
-            children.keys().cloned().collect()
+            let processes = self.processes.lock().await;
+            processes
+                .iter()
+                .filter(|(_, info)| info.status == ProcessStatus::Running)
+                .map(|(name, _)| name.clone())
+                .collect()
         };
 
         if process_names.is_empty() {
@@ -659,6 +689,9 @@ impl ProcessManager {
         if let Some(state) = &app_state {
             state
                 .add_system_log(format!("Stopping {} processes...", process_names.len()))
+                .await;
+        } else {
+            self.print_system_message(&format!("Stopping {} processes...", process_names.len()))
                 .await;
         }
 
@@ -909,10 +942,7 @@ impl ProcessManager {
         input: &str,
         app_state: Option<Arc<AppState>>,
     ) -> Result<()> {
-        // Log the command for debugging in interactive mode
-        if let Some(state) = &app_state {
-            state.add_system_log(format!("Command: {}", input)).await;
-        }
+        // Remove verbose command logging - the action messages are enough
         
         let parts: Vec<&str> = input.split_whitespace().collect();
 
@@ -1269,26 +1299,48 @@ async fn show_termination_summary(manager: &ProcessManager) {
     println!("{}", "-".repeat(42));
     
     for (name, info) in processes.iter() {
-        let total_runtime = if info.status == ProcessStatus::Running {
-            if let Some(start_time) = info.last_restart {
-                info.cumulative_runtime + start_time.elapsed()
+        // Calculate last session runtime
+        let last_runtime = if let Some(start_time) = info.last_restart {
+            if let Some(stop_time) = info.stopped_at {
+                stop_time.duration_since(start_time)
+            } else if info.status == ProcessStatus::Running {
+                start_time.elapsed()
             } else {
-                info.cumulative_runtime
+                Duration::from_secs(0)
             }
+        } else {
+            Duration::from_secs(0)
+        };
+
+        // Calculate total runtime
+        let total_runtime = if info.status == ProcessStatus::Running && info.last_restart.is_some() {
+            info.cumulative_runtime + info.last_restart.unwrap().elapsed()
         } else {
             info.cumulative_runtime
         };
 
-        let runtime_str = if total_runtime.as_secs() == 0 {
+        // Format runtime string
+        let runtime_str = if last_runtime.as_secs() == 0 && total_runtime.as_secs() == 0 {
             "N/A".to_string()
         } else {
-            let secs = total_runtime.as_secs();
-            if secs >= 3600 {
-                format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-            } else if secs >= 60 {
-                format!("{}m{}s", secs / 60, secs % 60)
+            let format_duration = |d: Duration| {
+                let secs = d.as_secs();
+                if secs >= 3600 {
+                    format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+                } else if secs >= 60 {
+                    format!("{}m{}s", secs / 60, secs % 60)
+                } else {
+                    format!("{secs}s")
+                }
+            };
+            
+            let last_str = format_duration(last_runtime);
+            // Only show total if it's meaningfully different from last runtime
+            if total_runtime > last_runtime && (total_runtime - last_runtime).as_secs() > 0 {
+                let total_str = format_duration(total_runtime);
+                format!("{} ({})", last_str, total_str)
             } else {
-                format!("{secs}s")
+                last_str
             }
         };
 

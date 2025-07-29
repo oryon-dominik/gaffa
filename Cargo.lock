@@ -484,7 +484,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "gaffa"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "clap",
@@ -498,6 +498,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "uuid",
+ "winapi",
 ]
 
 [[package]]
