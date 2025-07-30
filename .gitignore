@@ -4,3 +4,7 @@ target/
 # Project specific
 *.log
 test_*
+
+# assistants
+.claude/
+CLAUDE.md
