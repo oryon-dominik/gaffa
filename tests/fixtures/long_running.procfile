@@ -1,0 +1,2 @@
+server: powershell -Command "while ($true) { Start-Sleep -Seconds 1; Write-Host 'Server running...' }"
+worker: powershell -Command "while ($true) { Start-Sleep -Seconds 2; Write-Host 'Worker processing...' }"
