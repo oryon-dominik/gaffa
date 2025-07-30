@@ -10,7 +10,7 @@ There are some good Procfile-based process management tools around already:
 
 but they didn't work on the windows machines i have to work on.
 I do not need a lot of features, just some convenience to run my processes in a
-single terminal with a single command from my `justfile`.
+single terminal with a single command from my [justfile](https://crates.io/crates/just).
 
 A `gaffa` is someone who manages a group of performers, think of a rock band or
 circus. Whatever you like. 🧙‍♀️
