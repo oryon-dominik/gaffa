@@ -22,16 +22,17 @@ fn test_gaffa_no_args() {
         .output()
         .expect("Failed to execute command");
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Gaffa - Procfile Process Manager"));
-    assert!(stdout.contains("Usage:"));
+    // The new binary prints help to stderr when no command is given
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Cross-platform process manager for Procfile-based applications"));
+    assert!(stderr.contains("Usage:"));
 }
 
 #[test]
 fn test_gaffa_run_nonexistent_procfile() {
     let output = Command::new("cargo")
-        .args(["run", "--", "run", "-f", "nonexistent.procfile"])
+        .args(["run", "--", "run", "-p", "nonexistent.procfile"])
         .output()
         .expect("Failed to execute command");
 
@@ -50,7 +51,7 @@ fn test_gaffa_with_test_procfile() {
     // Start gaffa with the test procfile in a separate thread
     let handle = thread::spawn(|| {
         let mut child = Command::new("cargo")
-            .args(["run", "--", "run", "-f", "test_integration.procfile"])
+            .args(["run", "--", "run", "-p", "test_integration.procfile"])
             .spawn()
             .expect("Failed to start gaffa");
 
@@ -81,7 +82,7 @@ fn test_gaffa_log_file() {
                 "run",
                 "--",
                 "run",
-                "-f",
+                "-p",
                 "test_log.procfile",
                 "--log-file",
                 "test_output.log",
@@ -126,7 +127,7 @@ fn test_gaffa_specific_processes() {
                 "run",
                 "--",
                 "run",
-                "-f",
+                "-p",
                 "test_specific.procfile",
                 "web",
                 "worker",

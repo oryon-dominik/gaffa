@@ -62,6 +62,9 @@ gaffa run --env PORT=8000 --env PYTHONUNBUFFERED=1
 
 # Load environment from file
 gaffa run --env-file .env
+
+# Full command example
+gaffa run devserver tailwind --procfile procfile --log-file logs/gaffa.log --env PYTHONUNBUFFERED=1 --interactive
 ```
 
 ## Output Buffering

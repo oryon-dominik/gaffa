@@ -1,6 +1,6 @@
 [package]
 name = "gaffa"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["<oryon@cyberise.de>"]
 description = "Cross-platform process manager for Procfile-based process-collections."
@@ -12,6 +12,14 @@ categories = [
     "command-line-utilities",
     "development-tools"
 ]
+
+[[bin]]
+name = "gaffa"
+path = "src/bin/gaffa.rs"
+
+[[test]]
+name = "non_interactive_interrupt_test"
+path = "tests/non_interactive_interrupt_test.rs"
 
 [dependencies]
 tokio = { version = "1.47.0", features = ["full"] }

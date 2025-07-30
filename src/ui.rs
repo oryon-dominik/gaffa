@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,9 +19,10 @@ use ratatui::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{ProcessError, ProcessManager};
+use crate::process_manager::{ProcessError, ProcessManager, ProcessStatus};
 
 const MAX_LOG_LINES: usize = 1000;
+const MAX_COMMAND_HISTORY: usize = 100;
 
 // Color palette for different processes (magenta excluded - reserved for gaffa)
 // Must match the colors in main.rs for consistency
@@ -197,7 +197,7 @@ pub async fn run_terminal_ui(
 
             for (name, info) in processes.iter() {
                 // Calculate total runtime including current session if running
-                let total_runtime = if info.status == crate::ProcessStatus::Running {
+                let total_runtime = if info.status == ProcessStatus::Running {
                     if let Some(start_time) = info.last_restart {
                         info.cumulative_runtime + start_time.elapsed()
                     } else {
@@ -220,7 +220,7 @@ pub async fn run_terminal_ui(
                     };
 
                     // Show current session time, with total in brackets if different
-                    if info.status == crate::ProcessStatus::Running {
+                    if info.status == ProcessStatus::Running {
                         if let Some(start_time) = info.last_restart {
                             let session_secs = start_time.elapsed().as_secs();
                             let session_formatted = if session_secs >= 3600 {
@@ -374,9 +374,7 @@ pub async fn run_terminal_ui(
                     }
                 }
                 UICommand::Quit => {
-                    state_for_commands
-                        .add_system_log("Stopping all processes...".to_string())
-                        .await;
+                    // stop_all_with_state will log the shutdown message
                     manager_for_commands
                         .stop_all_with_state(Some(state_for_commands.clone()))
                         .await;
@@ -386,9 +384,9 @@ pub async fn run_terminal_ui(
                         let mut processes = manager_for_commands.processes.lock().await;
                         let children = manager_for_commands.children.lock().await;
                         for (name, info) in processes.iter_mut() {
-                            if info.status == crate::ProcessStatus::Running && !children.contains_key(name) {
+                            if info.status == ProcessStatus::Running && !children.contains_key(name) {
                                 // Process is marked as running but has no child - it must have been terminated
-                                info.status = crate::ProcessStatus::Stopped;
+                                info.status = ProcessStatus::Stopped;
                                 info.stopped_at = Some(std::time::Instant::now());
                             }
                         }
@@ -405,10 +403,7 @@ pub async fn run_terminal_ui(
                                 .filter(|info| info.last_restart.is_some()) // Only processes that were started
                                 .collect();
                             
-                            let all_stopped = running_processes.iter().all(|info| info.status == crate::ProcessStatus::Stopped);
-                            
-                            
-                            all_stopped
+                            running_processes.iter().all(|info| info.status == ProcessStatus::Stopped)
                         };
                         
                         if all_stopped {
@@ -450,7 +445,7 @@ pub async fn run_terminal_ui(
         ui_res = ui_result => ui_res,
         _ = command_handle => Ok(Ok(())),
         _ = tokio::signal::ctrl_c() => {
-            manager.stop_all_with_state(Some(state.clone())).await;
+            // Don't call stop_all here - the UI will handle it via UICommand::Quit
             Ok(Ok(()))
         }
     };
@@ -459,46 +454,93 @@ pub async fn run_terminal_ui(
     status_handle.abort();
     log_handle.abort();
 
+    // Store any final state we need before cleanup
+    let _should_show_summary = true; // We always want to show summary after interactive mode
+    
     // Cleanup terminal immediately
     cleanup_terminal();
-
+    
+    // Ensure output is flushed and terminal is ready for normal output
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    
+    // Add a delay to ensure terminal state is fully restored
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    
+    // Return with a flag indicating summary should be shown
     Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)]
 // Terminal cleanup function that MUST be called
 fn cleanup_terminal() {
-    use std::io::Write;
+    use std::io::{Write, stdout, stderr};
     
-    // Disable raw mode first
+    // First, ensure we show the cursor
+    let _ = execute!(stdout(), crossterm::cursor::Show);
+    
+    // Disable raw mode - this is critical for restoring terminal
     let _ = disable_raw_mode();
     
-    // Then leave alternate screen and disable mouse
-    let mut stdout = std::io::stdout();
+    // Leave alternate screen and disable mouse capture
     let _ = execute!(
-        stdout,
+        stdout(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
     );
     
-    // Force a flush to ensure all changes are applied
-    let _ = stdout.flush();
+    // Reset all text attributes to default
+    let _ = execute!(
+        stdout(),
+        crossterm::style::ResetColor,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
+    );
     
-    // Reset terminal to ensure it's in a good state
+    // Force flush both stdout and stderr
+    let _ = stdout().flush();
+    let _ = stderr().flush();
+    
+    // Give the terminal time to process all the commands
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    
+    // Platform-specific terminal restoration
+    #[cfg(unix)]
+    {
+        // On Unix, we might need to reset terminal attributes
+        use std::process::Command;
+        let _ = Command::new("stty").arg("sane").status();
+    }
+    
     #[cfg(windows)]
     {
-        // On Windows, reset console input mode to allow Ctrl+C
-        use winapi::um::consoleapi::SetConsoleMode;
+        // On Windows, reset console mode
+        use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
         use winapi::um::processenv::GetStdHandle;
-        use winapi::um::winbase::STD_INPUT_HANDLE;
-        use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
+        use winapi::um::winbase::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+        use winapi::um::wincon::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+            ENABLE_PROCESSED_OUTPUT, ENABLE_WRAP_AT_EOL_OUTPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        };
         
         unsafe {
-            let handle = GetStdHandle(STD_INPUT_HANDLE);
-            if handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
-                // Restore normal console mode with Ctrl+C handling
-                let mode = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
-                SetConsoleMode(handle, mode);
+            // Reset input handle
+            let input_handle = GetStdHandle(STD_INPUT_HANDLE);
+            if input_handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                let input_mode = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
+                SetConsoleMode(input_handle, input_mode);
+            }
+            
+            // Reset output handle
+            let output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if output_handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                let mut current_mode: u32 = 0;
+                if GetConsoleMode(output_handle, &mut current_mode) != 0 {
+                    let output_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | 
+                                    ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                    SetConsoleMode(output_handle, output_mode);
+                }
             }
         }
     }
@@ -625,6 +667,10 @@ fn run_app<B: Backend>(
                             let input = ui_state.input.trim().to_string();
                             if !input.is_empty() {
                                 ui_state.command_history.push(input.clone());
+                                // Limit command history size
+                                if ui_state.command_history.len() > MAX_COMMAND_HISTORY {
+                                    ui_state.command_history.remove(0);
+                                }
                                 ui_state.history_index = None;
 
                                 if input == "q" || input == "quit" {
