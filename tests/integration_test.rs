@@ -44,7 +44,11 @@ fn test_gaffa_run_nonexistent_procfile() {
 #[test]
 fn test_gaffa_with_test_procfile() {
     // Create a simple test Procfile
-    let procfile_content = "echo: echo 'Hello from test'";
+    let procfile_content = if cfg!(windows) {
+        "echo: cmd /c echo Hello from test"
+    } else {
+        "echo: echo 'Hello from test'"
+    };
     std::fs::write("test_integration.procfile", procfile_content)
         .expect("Failed to write test procfile");
 
@@ -72,7 +76,11 @@ fn test_gaffa_with_test_procfile() {
 #[test]
 fn test_gaffa_log_file() {
     // Create a simple test Procfile
-    let procfile_content = "logger: echo 'Log this message'";
+    let procfile_content = if cfg!(windows) {
+        "logger: cmd /c echo Log this message"
+    } else {
+        "logger: echo 'Log this message'"
+    };
     std::fs::write("test_log.procfile", procfile_content).expect("Failed to write test procfile");
 
     // Start gaffa with log file
@@ -115,8 +123,11 @@ fn test_gaffa_log_file() {
 #[test]
 fn test_gaffa_specific_processes() {
     // Create a test Procfile with multiple processes
-    let procfile_content =
-        "web: echo 'Web server'\nworker: echo 'Worker process'\nscheduler: echo 'Scheduler'";
+    let procfile_content = if cfg!(windows) {
+        "web: cmd /c echo Web server\nworker: cmd /c echo Worker process\nscheduler: cmd /c echo Scheduler"
+    } else {
+        "web: echo 'Web server'\nworker: echo 'Worker process'\nscheduler: echo 'Scheduler'"
+    };
     std::fs::write("test_specific.procfile", procfile_content)
         .expect("Failed to write test procfile");
 

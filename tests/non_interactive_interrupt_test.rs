@@ -74,10 +74,17 @@ fn test_termination_summary_format() {
 #[test]
 fn test_non_interactive_normal_exit() {
     // Create a test Procfile with processes that exit quickly
-    let procfile_content = r#"
+    let procfile_content = if cfg!(windows) {
+        r#"
+test1: cmd /c echo Test 1 done
+test2: cmd /c echo Test 2 done
+"#
+    } else {
+        r#"
 test1: echo "Test 1 done"
 test2: echo "Test 2 done"
-"#;
+"#
+    };
     
     let test_dir = std::env::temp_dir().join("gaffa_test_normal_exit");
     std::fs::create_dir_all(&test_dir).unwrap();
@@ -95,7 +102,7 @@ test2: echo "Test 2 done"
     
     // Should show termination summary
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Session terminated, summary:"), 
+    assert!(stderr.contains("Session terminated, summary"), 
             "Should show termination summary on normal exit");
     
     // Clean up

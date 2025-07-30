@@ -232,8 +232,8 @@ async fn run_non_interactive(
         
         // Print interrupt message
         let max_name_len = manager.get_max_name_length().await;
-        println!("\n{}", format_system_message_with_padding(
-            "Interrupt received, stopping processes...",
+        println!("{}", format_system_message_with_padding(
+            "Interrupt received, stopping processes gracefully...",
             max_name_len
         ));
     }
@@ -255,10 +255,7 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
     let process_colors = manager.process_colors.lock().await;
 
     // Print to stderr to ensure it's not buffered and shows immediately
-    eprintln!("\n\n");
-    eprintln!("{}", "=".repeat(79));
-    eprintln!("Session terminated, summary:");
-    eprintln!();
+    eprintln!("------ Session terminated, summary: ------");
 
     // Simpler header format
     let header_padding = " ".repeat(max_name_len.saturating_sub(7));

@@ -876,10 +876,10 @@ impl ProcessManager {
         // Log that we're starting shutdown
         if let Some(state) = &app_state {
             state
-                .add_system_log("Interrupt received, stopping processes...".to_string())
+                .add_system_log("Interrupt received, stopping processes gracefully...".to_string())
                 .await;
         } else {
-            self.print_system_message("Interrupt received, stopping processes...")
+            self.print_system_message("Interrupt received, stopping processes gracefully...")
                 .await;
         }
 
