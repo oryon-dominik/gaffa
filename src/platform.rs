@@ -1,71 +1,50 @@
 use tokio::process::Child;
-use crate::constants::*;
 
 #[cfg(target_os = "windows")]
 pub mod windows {
     use super::*;
-    #[allow(unused_imports)]
-    use crate::constants::CREATE_NEW_PROCESS_GROUP;
+    use crate::constants::GRACEFUL_SHUTDOWN_TIMEOUT;
+    use std::time::Duration;
     
     pub fn configure_command(cmd: &mut tokio::process::Command) {
-        // Tokio's Command doesn't expose creation_flags on Windows yet
-        // This would need platform-specific handling or a different approach
+        // On Windows, we'll use the default console group
+        // This allows processes to receive Ctrl+C from the console
         let _ = cmd; // Suppress unused warning
     }
     
     pub async fn terminate_process(child: &mut Child) -> Option<i32> {
+        // First try to terminate the process gracefully using taskkill without /F
         if let Some(pid) = child.id() {
-            // Try Ctrl+C first (SIGINT)
-            unsafe {
-                use winapi::um::wincon::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
-                let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
+            // Try taskkill without /F (force) flag for graceful termination
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/PID", &pid.to_string()])
+                .output();
+            
+            // Check periodically if the process has exited
+            let check_interval = Duration::from_millis(500);
+            let max_checks = (GRACEFUL_SHUTDOWN_TIMEOUT.as_millis() / check_interval.as_millis()) as usize;
+            
+            for _ in 0..max_checks {
+                // Check if process exited
+                if let Ok(Some(status)) = child.try_wait() {
+                    return status.code();
+                }
+                
+                // Wait before next check
+                tokio::time::sleep(check_interval).await;
             }
             
-            // Give time for graceful shutdown
-            tokio::time::sleep(PROCESS_KILL_TIMEOUT).await;
-            
-            // Check if process exited
+            // Final check after full timeout
             if let Ok(Some(status)) = child.try_wait() {
                 return status.code();
             }
             
-            // Try Ctrl+C again
-            unsafe {
-                use winapi::um::wincon::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
-                let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
-            }
-            
-            // Give more time
-            tokio::time::sleep(PROCESS_KILL_TIMEOUT).await;
-            
-            // Check again
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
-            
-            // Now try Ctrl+Break as last resort before force kill
-            unsafe {
-                use winapi::um::wincon::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
-                let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-            }
-            
-            tokio::time::sleep(PROCESS_KILL_TIMEOUT).await;
-            
-            // Check once more
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
-
-            // Try child.kill() which might work for some processes
-            let _ = child.kill().await;
-            tokio::time::sleep(KILL_RETRY_WAIT).await;
-            
-            // Check again
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
+            // Process is still running - it's ignoring termination requests
+            // Don't force kill - let the process manager handle it
+            None
+        } else {
+            None
         }
-        None
     }
     
     pub async fn force_kill_process(child: &mut Child) -> Option<i32> {
@@ -82,6 +61,7 @@ pub mod windows {
 #[cfg(not(target_os = "windows"))]
 pub mod unix {
     use super::*;
+    use crate::constants::{SIGTERM_WAIT_TIMEOUT, PROCESS_KILL_TIMEOUT, PROCESS_WAIT_TIMEOUT};
     
     pub fn configure_command(cmd: &mut tokio::process::Command) {
         use std::os::unix::process::CommandExt;

@@ -273,17 +273,22 @@ impl ProcessManager {
         app_state: Option<Arc<AppState>>,
         log_messages: bool,
     ) -> Result<()> {
+        // Check if process is actually running (exists in children map)
+        {
+            let children = self.children.lock().await;
+            if children.contains_key(name) {
+                return Err(ProcessError::ProcessAlreadyRunning {
+                    name: name.to_string(),
+                });
+            }
+        }
+        
         let process_info = {
             let mut processes = self.processes.lock().await;
             match processes.get_mut(name) {
-                Some(info) if info.status != ProcessStatus::Running => {
+                Some(info) => {
                     info.status = ProcessStatus::Restarting;
                     info.clone()
-                }
-                Some(_) => {
-                    return Err(ProcessError::ProcessAlreadyRunning {
-                        name: name.to_string(),
-                    });
                 }
                 None => {
                     return Err(ProcessError::ProcessNotFound {
@@ -635,6 +640,27 @@ impl ProcessManager {
         if let Some(mut child) = children.remove(name) {
             let exit_code = self.terminate_process(&mut child).await;
 
+            // If process didn't terminate gracefully, it's still running
+            if exit_code.is_none() {
+                // Put it back in the children map since it's still running
+                children.insert(name.to_string(), child);
+                
+                if log_messages {
+                    if let Some(state) = &app_state {
+                        state
+                            .add_system_log(format!("Process '{name}' is ignoring termination signals"))
+                            .await;
+                    } else {
+                        self.print_system_message(&format!("Process '{name}' is ignoring termination signals"))
+                            .await;
+                    }
+                }
+                
+                // Don't return error - the process is still running but stubborn
+                // This allows restart to work properly
+                return Ok(());
+            }
+
             // Abort the monitor handle for this process
             {
                 let mut monitor_handles = self.monitor_handles.lock().await;
@@ -726,11 +752,57 @@ impl ProcessManager {
                 .await;
         }
         
-        // Stop the process quietly (we already announced the restart)
-        let _ = self.stop_process_internal(name, app_state.clone(), false).await;
+        // Try to stop the process quietly (we already announced the restart)
+        let stop_result = self.stop_process_internal(name, app_state.clone(), false).await;
         
-        // Brief pause before restart
-        sleep(Duration::from_millis(200)).await;
+        // If stop failed (process might be stubborn), force kill it for restart
+        if stop_result.is_ok() {
+            // Process stopped gracefully, just wait a bit
+            sleep(Duration::from_millis(200)).await;
+        } else {
+            // Process might be stubborn or already stopped, check if it's still in children
+            let mut children = self.children.lock().await;
+            if let Some(mut child) = children.remove(name) {
+                // Force kill the stubborn process for restart
+                let _ = force_kill_process(&mut child).await;
+                
+                // Clean up handles
+                {
+                    let mut monitor_handles = self.monitor_handles.lock().await;
+                    if let Some(handle) = monitor_handles.remove(name) {
+                        handle.abort();
+                    }
+                }
+                {
+                    let mut output_handles = self.output_handles.lock().await;
+                    if let Some(handles) = output_handles.remove(name) {
+                        for handle in handles {
+                            handle.abort();
+                        }
+                    }
+                }
+                
+                // Update process status
+                let mut processes = self.processes.lock().await;
+                if let Some(info) = processes.get_mut(name) {
+                    info.status = ProcessStatus::Stopped;
+                    info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
+                }
+                
+                // Log the force kill
+                if let Some(state) = &app_state {
+                    state
+                        .add_system_log(format!("Force killed stubborn process '{name}' for restart"))
+                        .await;
+                } else {
+                    self.print_system_message(&format!("Force killed stubborn process '{name}' for restart"))
+                        .await;
+                }
+                
+                // Wait a bit after force kill
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
         
         // Start the process quietly (we already announced the restart)
         self.start_process_internal(name, app_state, false).await

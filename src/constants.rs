@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 // Process management timeouts
-pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-pub const PROCESS_KILL_TIMEOUT: Duration = Duration::from_secs(2);
-pub const SIGTERM_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const PROCESS_KILL_TIMEOUT: Duration = Duration::from_secs(3);
+pub const SIGTERM_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const KILL_RETRY_WAIT: Duration = Duration::from_secs(1);
 

@@ -178,6 +178,10 @@ async fn run_non_interactive(
                 &format!("Starting process '{}'...", name),
                 max_name_len
             ));
+            // Ensure the message is flushed before starting the process
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            
             if let Err(e) = manager.start_process_quietly(&name).await {
                 eprintln!("{}", format_error_message_with_padding(&format!("Failed to start process '{}': {}", name, e), max_name_len));
                 return Err(e);
@@ -191,6 +195,10 @@ async fn run_non_interactive(
                 &format!("Starting process '{}'...", name),
                 max_name_len
             ));
+            // Ensure the message is flushed before starting the process
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            
             if let Err(e) = manager.start_process_quietly(&name).await {
                 eprintln!("{}", format_error_message_with_padding(&format!("Failed to start process '{}': {}", name, e), max_name_len));
                 return Err(e);
