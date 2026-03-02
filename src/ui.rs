@@ -445,10 +445,12 @@ pub async fn run_terminal_ui(
         ui_res = ui_result => ui_res,
         _ = command_handle => Ok(Ok(())),
         _ = tokio::signal::ctrl_c() => {
-            // Don't call stop_all here - the UI will handle it via UICommand::Quit
             Ok(Ok(()))
         }
     };
+
+    // Ensure all child processes are stopped regardless of which select branch won
+    manager.stop_all().await;
 
     // Clean up
     status_handle.abort();

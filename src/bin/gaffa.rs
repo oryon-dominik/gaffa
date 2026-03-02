@@ -225,26 +225,19 @@ async fn run_non_interactive(
     }
     
     let was_interrupted = interrupted.load(Ordering::SeqCst);
-    
-    // If interrupted, wait a bit for child process output to settle
+
+    // If interrupted, gracefully stop all child processes
     if was_interrupted {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        
-        // Print interrupt message
-        let max_name_len = manager.get_max_name_length().await;
-        println!("{}", format_system_message_with_padding(
-            "Interrupt received, stopping processes gracefully...",
-            max_name_len
-        ));
+        manager.stop_all().await;
     }
-    
+
     show_termination_summary(&manager, was_interrupted).await;
-    
+
     if was_interrupted {
         tokio::time::sleep(Duration::from_millis(100)).await;
         std::process::exit(130);
     }
-    
+
     Ok(interrupted.load(Ordering::SeqCst))
 }
 
