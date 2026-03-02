@@ -1367,6 +1367,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stop_all_terminates_running_processes() {
+        let manager = Arc::new(ProcessManager::new());
+        let procfile_content = if cfg!(windows) {
+            "sleeper: cmd /c \"ping -n 60 127.0.0.1 >nul\""
+        } else {
+            "sleeper: sleep 60"
+        };
+        let procfile_path = create_test_procfile(procfile_content);
+
+        manager.load_procfile(&procfile_path).await.unwrap();
+        manager.start_process("sleeper").await.unwrap();
+
+        // Give the process time to start
+        sleep(Duration::from_secs(1)).await;
+
+        // Verify it's running
+        {
+            let processes = manager.processes.lock().await;
+            assert_eq!(processes["sleeper"].status, ProcessStatus::Running);
+        }
+
+        // Collect child PID before stop_all
+        let child_pid: Option<u32> = {
+            let children = manager.children.lock().await;
+            children.values().next().and_then(|c| c.id())
+        };
+        assert!(child_pid.is_some(), "Should have a child PID");
+        let child_pid = child_pid.unwrap();
+
+        // Call stop_all — this is the code path exercised by our Ctrl+C fix
+        manager.stop_all().await;
+
+        // Verify the process is stopped
+        {
+            let processes = manager.processes.lock().await;
+            assert_eq!(processes["sleeper"].status, ProcessStatus::Stopped);
+        }
+
+        // Verify child process is no longer running (Unix only)
+        #[cfg(unix)]
+        {
+            let alive = unsafe { libc::kill(child_pid as i32, 0) };
+            assert_ne!(alive, 0, "Child PID {} should no longer be alive", child_pid);
+        }
+
+        cleanup_test_procfile(&procfile_path);
+    }
+
+    #[tokio::test]
+    async fn test_stop_all_is_idempotent() {
+        let manager = Arc::new(ProcessManager::new());
+        let procfile_content = if cfg!(windows) {
+            "test: cmd /c \"ping -n 60 127.0.0.1 >nul\""
+        } else {
+            "test: sleep 60"
+        };
+        let procfile_path = create_test_procfile(procfile_content);
+
+        manager.load_procfile(&procfile_path).await.unwrap();
+        manager.start_process("test").await.unwrap();
+        sleep(Duration::from_secs(1)).await;
+
+        // First call stops the process
+        manager.stop_all().await;
+        {
+            let processes = manager.processes.lock().await;
+            assert_eq!(processes["test"].status, ProcessStatus::Stopped);
+        }
+
+        // Second call should be a no-op (no panic, no error)
+        manager.stop_all().await;
+        {
+            let processes = manager.processes.lock().await;
+            assert_eq!(processes["test"].status, ProcessStatus::Stopped);
+        }
+
+        cleanup_test_procfile(&procfile_path);
+    }
+
+    #[tokio::test]
     async fn test_handle_command_status() {
         let manager = ProcessManager::new();
         // The handle_command("status") doesn't require a loaded procfile
