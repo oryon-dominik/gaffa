@@ -175,19 +175,17 @@ async fn test_natural_exit_handle_cleanup() {
     // Wait for natural exit
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // DOCUMENTING KNOWN BUG: handles remain after natural exit
+    // FIXED [HANDLE_LEAK]: handles are now cleaned up on natural exit
     let monitor_count = manager.monitor_handle_count().await;
     let output_count = manager.output_handle_count().await;
 
-    // These document the CURRENT (buggy) behavior.
-    // After refactoring, both should be 0.
     assert_eq!(
-        monitor_count, 1,
-        "BUG [HANDLE_LEAK]: monitor handle remains after natural exit (should be 0)"
+        monitor_count, 0,
+        "FIXED [HANDLE_LEAK]: monitor handle should be cleaned up after natural exit"
     );
     assert_eq!(
-        output_count, 2,
-        "BUG [HANDLE_LEAK]: output handles remain after natural exit (should be 0)"
+        output_count, 0,
+        "FIXED [HANDLE_LEAK]: output handles should be cleaned up after natural exit"
     );
 
     cleanup_procfile(&path);
@@ -641,27 +639,25 @@ async fn test_fast_output_process_doesnt_block() {
 // ===========================================================================
 
 #[tokio::test]
-async fn test_appstate_new_receiver_is_dropped() {
-    // KNOWN BUG [LOST_LOGS]: AppState::new() creates a channel where the
-    // receiver (_rx) is immediately dropped. Logs sent before run_terminal_ui()
-    // replaces the sender are silently lost.
+async fn test_appstate_buffers_logs_before_ui_starts() {
+    // FIXED [LOST_LOGS]: AppState::new() no longer creates a throwaway channel.
+    // Logs sent before run_terminal_ui() replaces the sender are buffered directly.
     let state = AppState::new();
 
     state
         .add_log(
             "test".to_string(),
-            "this log will be lost".to_string(),
+            "this log will be buffered".to_string(),
             false,
         )
         .await;
 
-    // AppState.logs is empty because the receiver was dropped.
-    // The send succeeds (unbounded channel doesn't error), but nobody reads.
+    // Logs are now buffered directly into AppState.logs when no consumer exists.
     let logs = state.logs.lock().await;
     assert_eq!(
         logs.len(),
-        0,
-        "BUG [LOST_LOGS]: logs sent before UI starts are lost"
+        1,
+        "FIXED [LOST_LOGS]: logs sent before UI starts are now buffered"
     );
 }
 
@@ -675,7 +671,7 @@ async fn test_appstate_logs_are_populated_via_channel_consumer() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LogEntry>();
     {
         let mut state_tx = state.tx.lock().await;
-        *state_tx = tx;
+        *state_tx = Some(tx);
     }
 
     state

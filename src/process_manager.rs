@@ -359,6 +359,15 @@ impl ProcessManager {
                             state.add_system_log(exit_msg).await;
                         }
 
+                        // Clean up own handles
+                        {
+                            let mut rt = runtime_arc.lock().await;
+                            rt.monitor_handles.remove(&name_str);
+                            // Don't abort output handles - let them finish draining
+                            // Just remove the tracking entries
+                            rt.output_handles.remove(&name_str);
+                        }
+
                         break;
                     }
                 } else {
@@ -582,58 +591,39 @@ impl ProcessManager {
             log_messages: false,
         };
 
-        // Try to stop the process quietly (we already announced the restart)
-        let stop_result = self.stop_process_with_opts(name, &quiet_opts).await;
+        // Attempt graceful stop
+        let _ = self.stop_process_with_opts(name, &quiet_opts).await;
 
-        // If stop failed (process might be stubborn), force kill it for restart
-        if stop_result.is_ok() {
-            // Process stopped gracefully, just wait a bit
-            sleep(Duration::from_millis(200)).await;
-        } else {
-            // Process might be stubborn or already stopped, check if it's still in children
-            let maybe_child = {
-                let mut runtime = self.runtime.lock().await;
-                runtime.children.remove(name)
-            };
+        // Check if child is actually gone (stop may return Ok for stubborn processes)
+        let still_running = {
+            let rt = self.runtime.lock().await;
+            rt.children.contains_key(name)
+        };
 
-            if let Some(mut child) = maybe_child {
-                // Force kill the stubborn process for restart
+        if still_running {
+            // Force kill for restart
+            let mut rt = self.runtime.lock().await;
+            if let Some(mut child) = rt.children.remove(name) {
+                drop(rt); // drop lock before async I/O
                 let _ = force_kill_process(&mut child).await;
-
-                // Clean up handles and update process status
-                {
-                    let mut runtime = self.runtime.lock().await;
-                    if let Some(handle) = runtime.monitor_handles.remove(name) {
-                        handle.abort();
-                    }
-                    if let Some(handles) = runtime.output_handles.remove(name) {
-                        for handle in handles {
-                            handle.abort();
-                        }
-                    }
-                    if let Some(info) = runtime.processes.get_mut(name) {
-                        info.status = ProcessStatus::Stopped;
-                        info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
+                // Re-acquire lock for cleanup
+                let mut rt = self.runtime.lock().await;
+                if let Some(handle) = rt.monitor_handles.remove(name) {
+                    handle.abort();
+                }
+                if let Some(handles) = rt.output_handles.remove(name) {
+                    for h in handles {
+                        h.abort();
                     }
                 }
-
-                // Log the force kill
-                if let Some(state) = &opts.app_state {
-                    state
-                        .add_system_log(format!(
-                            "Force killed stubborn process '{name}' for restart"
-                        ))
-                        .await;
-                } else {
-                    self.print_system_message(&format!(
-                        "Force killed stubborn process '{name}' for restart"
-                    ))
-                    .await;
+                if let Some(info) = rt.processes.get_mut(name) {
+                    info.status = ProcessStatus::Stopped;
+                    info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
                 }
-
-                // Wait a bit after force kill
-                sleep(Duration::from_millis(500)).await;
             }
+            sleep(Duration::from_millis(500)).await;
+        } else {
+            sleep(Duration::from_millis(200)).await;
         }
 
         // Start the process quietly (we already announced the restart)

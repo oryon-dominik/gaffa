@@ -54,16 +54,15 @@ pub enum UICommand {
 
 pub struct AppState {
     pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
-    pub tx: Arc<Mutex<mpsc::UnboundedSender<LogEntry>>>,
+    pub tx: Arc<Mutex<Option<mpsc::UnboundedSender<LogEntry>>>>,
     pub status_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<String>>>>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        let (tx, _rx) = mpsc::unbounded_channel();
         Self {
             logs: Arc::new(Mutex::new(VecDeque::new())),
-            tx: Arc::new(Mutex::new(tx)),
+            tx: Arc::new(Mutex::new(None)), // No channel initially
             status_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -76,7 +75,14 @@ impl AppState {
             is_error,
         };
         let tx = self.tx.lock().await;
-        let _ = tx.send(entry);
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(entry);
+        } else {
+            // No consumer yet - buffer directly
+            drop(tx);
+            let mut logs = self.logs.lock().await;
+            logs.push_back(entry);
+        }
     }
 
     pub async fn add_system_log(&self, content: String) {
@@ -181,7 +187,7 @@ pub async fn run_terminal_ui(
     // Update the app state's channels
     {
         let mut tx = state.tx.lock().await;
-        *tx = log_tx.clone();
+        *tx = Some(log_tx.clone());
 
         let mut stx = state.status_tx.lock().await;
         *stx = Some(status_tx.clone());
@@ -287,7 +293,6 @@ pub async fn run_terminal_ui(
 
     // Task to handle logs
     let log_handle = tokio::spawn(async move {
-        let mut logs = VecDeque::new();
         while let Some(entry) = log_rx.recv().await {
             // Write to log file if available
             if let Some(log_file) = &log_file {
@@ -306,13 +311,12 @@ pub async fn run_terminal_ui(
                 let _ = file.flush();
             }
 
-            logs.push_back(entry);
-            if logs.len() > MAX_LOG_LINES {
-                logs.pop_front();
-            }
-            // Update the shared state
+            // Push directly into shared state (eliminates clone_from overhead)
             let mut state_logs = state_for_logs.logs.lock().await;
-            state_logs.clone_from(&logs);
+            state_logs.push_back(entry);
+            if state_logs.len() > MAX_LOG_LINES {
+                state_logs.pop_front();
+            }
         }
     });
 
