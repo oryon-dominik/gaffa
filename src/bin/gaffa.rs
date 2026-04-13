@@ -1,5 +1,4 @@
 use clap::{Arg, Command};
-use colored::Colorize;
 use gaffa::output;
 use gaffa::{LifecycleOptions, ProcessError, ProcessManager, Result};
 use std::collections::HashMap;
@@ -41,7 +40,32 @@ fn reset_terminal() {
 fn reset_terminal_simple() {
     use std::io::Write;
 
-    // Just ensure cursor is visible and colors are reset
+    // Re-enable virtual terminal processing on Windows so that ANSI codes
+    // and \n → \r\n translation work correctly after Ctrl+C.
+    #[cfg(windows)]
+    {
+        use winapi::shared::minwindef::DWORD;
+        use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::STD_OUTPUT_HANDLE;
+
+        const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
+        const ENABLE_WRAP_AT_EOL_OUTPUT: DWORD = 0x0002;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode: DWORD = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                mode |= ENABLE_PROCESSED_OUTPUT
+                    | ENABLE_WRAP_AT_EOL_OUTPUT
+                    | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                let _ = SetConsoleMode(handle, mode);
+            }
+        }
+    }
+
+    // Ensure cursor is visible and colors are reset
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::cursor::Show,
@@ -218,20 +242,32 @@ async fn run_non_interactive(
 
     let was_interrupted = interrupted.load(Ordering::SeqCst);
 
-    // If interrupted, wait a bit for child process output to settle
     if was_interrupted {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Reset terminal state FIRST — Ctrl+C on Windows corrupts the
+        // console mode, causing raw ANSI codes and broken newlines in
+        // any output that follows (including process shutdown messages).
+        reset_terminal_simple();
 
-        // Print interrupt message
-        let max_name_len = manager.get_max_name_length().await;
-        println!(
-            "{}",
-            output::format_gaffa_message(
-                "Interrupt received, stopping processes gracefully...",
-                max_name_len
-            )
-        );
+        // Stop all child processes before printing the summary so their
+        // output does not interleave with the termination report.
+        manager.stop_all_with_opts(&LifecycleOptions::quiet()).await;
+
+        // Fix status of processes that exited but weren't tracked
+        manager.fix_orphaned_process_status().await;
     }
+
+    // Wait for output handlers to fully drain
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Flush stdout so prior process output is complete before summary
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+
+    // Reset again before summary in case process output corrupted state
+    reset_terminal_simple();
 
     show_termination_summary(&manager, was_interrupted).await;
 
@@ -248,17 +284,19 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
     let max_name_len = manager.get_max_name_length().await;
     let snapshot = manager.process_snapshot().await;
 
-    // Print to stderr to ensure it's not buffered and shows immediately
-    eprintln!("------ Session terminated, summary: ------");
+    let table_width = max_name_len + 30;
+
+    eprintln!();
+    eprintln!("{}", "-".repeat(table_width));
+    eprintln!("  Session terminated");
+    eprintln!("{}", "-".repeat(table_width));
 
     // Simpler header format
     let header_padding = " ".repeat(max_name_len.saturating_sub(7));
-    eprintln!("     process{}        status       runtime", header_padding);
-    eprintln!("{}", "-".repeat(42));
+    eprintln!("  process{}     status        runtime", header_padding);
+    eprintln!("{}", "-".repeat(table_width));
 
-    for (name, info, color) in &snapshot {
-        let name_colored = name.color(*color);
-
+    for (name, info, _color) in &snapshot {
         // Calculate runtime
         let runtime = if let Some(stopped_at) = info.stopped_at {
             if let Some(last_restart) = info.last_restart {
@@ -275,6 +313,15 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
         // Format runtime string
         let runtime_str = if runtime.as_millis() == 0 {
             "N/A".to_string()
+        } else if runtime.as_secs() >= 3600 {
+            let h = runtime.as_secs() / 3600;
+            let m = (runtime.as_secs() % 3600) / 60;
+            let s = runtime.as_secs() % 60;
+            format!("{h}h {m}m {s}s")
+        } else if runtime.as_secs() >= 60 {
+            let m = runtime.as_secs() / 60;
+            let s = runtime.as_secs() % 60;
+            format!("{m}m {s}s")
         } else if runtime.as_secs() >= 1 {
             format!("{}s", runtime.as_secs())
         } else {
@@ -293,23 +340,62 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
             _ => "unknown".to_string(),
         };
 
-        // Format with proper alignment
+        // Format with proper alignment — plain text, no ANSI colors
         let name_padding = " ".repeat(max_name_len.saturating_sub(name.len()));
         eprintln!(
-            "   {}{} {:>12} {:>12}",
-            name_colored,
-            name_padding,
-            status_str.yellow(),
-            runtime_str
+            "  {}{} {:>12} {:>12}",
+            name, name_padding, status_str, runtime_str
         );
     }
+
+    eprintln!("{}", "-".repeat(table_width));
 
     // Ensure output is flushed
     use std::io::Write;
     let _ = std::io::stderr().flush();
 }
 
+/// Install a synchronous console ctrl handler on Windows that resets the
+/// console output mode the moment Ctrl+C is pressed — before any child
+/// process or async handler writes garbled output.
+#[cfg(windows)]
+fn install_console_ctrl_handler() {
+    use winapi::shared::minwindef::DWORD;
+    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleCtrlHandler, SetConsoleMode};
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_OUTPUT_HANDLE;
+
+    const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
+    const ENABLE_WRAP_AT_EOL_OUTPUT: DWORD = 0x0002;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+
+    unsafe extern "system" fn handler(_ctrl_type: DWORD) -> i32 {
+        // Re-enable processed output and VT processing so ANSI codes
+        // and \n→\r\n translation work correctly.
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode: DWORD = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                mode |= ENABLE_PROCESSED_OUTPUT
+                    | ENABLE_WRAP_AT_EOL_OUTPUT
+                    | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                SetConsoleMode(handle, mode);
+            }
+        }
+        // Return FALSE (0) so the default handler (which terminates) does NOT
+        // run — tokio's signal handler will pick it up instead.
+        0
+    }
+
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
 async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
+    #[cfg(windows)]
+    install_console_ctrl_handler();
+
     let procfile_path = run_matches
         .get_one::<String>("procfile")
         .map(String::as_str)

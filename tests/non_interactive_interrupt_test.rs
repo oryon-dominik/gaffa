@@ -61,12 +61,12 @@ fn test_termination_summary_format() {
     // We can't easily test the actual Ctrl+C behavior in automated tests
 
     // The termination summary should include:
-    // - A header with "Session terminated, summary:"
+    // - A header with "Session terminated"
     // - Column headers: process, status, runtime
     // - Each process with its status
 
     // This is more of a regression test to ensure the format doesn't change
-    let expected_header = "Session terminated, summary:";
+    let expected_header = "Session terminated";
     let expected_columns = "process";
 
     // These strings should appear in the termination summary
@@ -112,7 +112,7 @@ test2: echo "Test 2 done"
     // Should show termination summary
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Session terminated, summary"),
+        stderr.contains("Session terminated"),
         "Should show termination summary on normal exit"
     );
 
