@@ -12,7 +12,9 @@ use tokio::{
 
 use crate::constants::*;
 use crate::output;
-use crate::platform::{configure_command, force_kill_process, terminate_process};
+use crate::platform::{
+    assign_child_to_job, configure_command, force_kill_process, terminate_process,
+};
 use crate::procfile;
 use crate::types::*;
 use crate::ui::AppState;
@@ -281,6 +283,10 @@ impl ProcessManager {
             name: name.to_string(),
             source: e,
         })?;
+
+        // Assign the child to the platform Job Object (Windows) so it is
+        // automatically killed when gaffa exits — even on crash.
+        assign_child_to_job(&child);
 
         let stdout = child.stdout.take().expect("stdout pipe");
         let stderr = child.stderr.take().expect("stderr pipe");
