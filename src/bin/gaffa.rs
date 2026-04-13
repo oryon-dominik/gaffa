@@ -1,41 +1,11 @@
 use clap::{Arg, Command};
 use colored::Colorize;
+use gaffa::output;
 use gaffa::{LifecycleOptions, ProcessError, ProcessManager, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-
-// UI module is accessed directly from gaffa crate when needed
-
-/// Format a system message with proper alignment (matching ProcessManager's format)
-#[allow(dead_code)]
-fn format_system_message(message: &str) -> String {
-    format_system_message_with_padding(message, 0)
-}
-
-/// Format a system message with specific padding
-fn format_system_message_with_padding(message: &str, max_name_len: usize) -> String {
-    let colored_gaffa = "gaffa".magenta();
-    let colored_msg = message.magenta();
-    let padding_len = max_name_len.saturating_sub(5).max(0); // "gaffa" is 5 chars
-    let padding = " ".repeat(padding_len);
-    format!("{colored_gaffa}{padding} | {colored_msg}")
-}
-
-/// Format an error message with proper alignment
-fn format_error_message(message: &str) -> String {
-    format_error_message_with_padding(message, 0)
-}
-
-/// Format an error message with specific padding
-fn format_error_message_with_padding(message: &str, max_name_len: usize) -> String {
-    let colored_gaffa = "gaffa".red();
-    let colored_msg = message.red();
-    let padding_len = max_name_len.saturating_sub(5).max(0); // "gaffa" is 5 chars
-    let padding = " ".repeat(padding_len);
-    format!("{colored_gaffa}{padding} | {colored_msg}")
-}
 
 /// Reset terminal to normal state.
 fn reset_terminal() {
@@ -127,17 +97,14 @@ async fn run_non_interactive(
 
     println!(
         "{}",
-        format_system_message_with_padding(
+        output::format_gaffa_message(
             &format!("Loading {} processes from procfile", process_count),
             max_name_len
         )
     );
     println!(
         "{}",
-        format_system_message_with_padding(
-            "Press 'q' or Ctrl+C to stop all processes",
-            max_name_len
-        )
+        output::format_gaffa_message("Press 'q' or Ctrl+C to stop all processes", max_name_len)
     );
 
     // Spawn signal handler
@@ -180,7 +147,7 @@ async fn run_non_interactive(
         for name in names {
             println!(
                 "{}",
-                format_system_message_with_padding(
+                output::format_gaffa_message(
                     &format!("Starting process '{}'...", name),
                     max_name_len
                 )
@@ -195,7 +162,7 @@ async fn run_non_interactive(
             {
                 eprintln!(
                     "{}",
-                    format_error_message_with_padding(
+                    output::format_error_message(
                         &format!("Failed to start process '{}': {}", name, e),
                         max_name_len
                     )
@@ -209,7 +176,7 @@ async fn run_non_interactive(
         for name in process_names {
             println!(
                 "{}",
-                format_system_message_with_padding(
+                output::format_gaffa_message(
                     &format!("Starting process '{}'...", name),
                     max_name_len
                 )
@@ -224,7 +191,7 @@ async fn run_non_interactive(
             {
                 eprintln!(
                     "{}",
-                    format_error_message_with_padding(
+                    output::format_error_message(
                         &format!("Failed to start process '{}': {}", name, e),
                         max_name_len
                     )
@@ -259,7 +226,7 @@ async fn run_non_interactive(
         let max_name_len = manager.get_max_name_length().await;
         println!(
             "{}",
-            format_system_message_with_padding(
+            output::format_gaffa_message(
                 "Interrupt received, stopping processes gracefully...",
                 max_name_len
             )
@@ -368,12 +335,15 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
                 // We don't have max_name_len yet, so use default formatting
                 eprintln!(
                     "{}",
-                    format_error_message(&format!(
-                        "Invalid environment variable format: {}",
-                        env_arg
-                    ))
+                    output::format_error_message(
+                        &format!("Invalid environment variable format: {}", env_arg),
+                        0,
+                    )
                 );
-                eprintln!("{}", format_error_message("Expected format: KEY=VALUE"));
+                eprintln!(
+                    "{}",
+                    output::format_error_message("Expected format: KEY=VALUE", 0)
+                );
                 return Err(ProcessError::InvalidFormat {
                     line: env_arg.clone(),
                 });
@@ -440,7 +410,7 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
             Err(e) => {
                 // In case of error, we should reset the terminal
                 reset_terminal();
-                eprintln!("{}", format_error_message(&e.to_string()));
+                eprintln!("{}", output::format_error_message(&e.to_string(), 0));
                 return Err(e);
             }
         }
@@ -452,7 +422,7 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
             Err(e) => {
                 // Reset terminal on error
                 reset_terminal();
-                eprintln!("{}", format_error_message(&e.to_string()));
+                eprintln!("{}", output::format_error_message(&e.to_string(), 0));
                 return Err(e);
             }
         }
@@ -534,7 +504,7 @@ async fn main() {
         }
         Some(("run", run_matches)) => {
             if let Err(e) = handle_run_command(run_matches).await {
-                eprintln!("{}", format_error_message(&e.to_string()));
+                eprintln!("{}", output::format_error_message(&e.to_string(), 0));
                 reset_terminal();
                 std::process::exit(1);
             }

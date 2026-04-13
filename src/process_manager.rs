@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
     process::{Child, Command as TokioCommand},
     sync::Mutex,
     time::sleep,
 };
 
 use crate::constants::*;
+use crate::output;
 use crate::platform::{configure_command, force_kill_process, terminate_process};
 use crate::procfile;
 use crate::types::*;
@@ -400,45 +400,17 @@ impl ProcessManager {
             (max_len, color)
         };
 
-        let name_str = name.to_string();
-        let stdout_reader = BufReader::new(stdout);
-        let app_state_stdout = app_state.clone();
-        let log_file_stdout = log_file.clone();
+        let (stdout_handle, stderr_handle) = output::spawn_output_handlers(
+            name,
+            stdout,
+            stderr,
+            app_state,
+            log_file,
+            max_name_len,
+            process_color,
+        );
 
-        let stdout_handle = tokio::spawn(async move {
-            let mut lines = stdout_reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim_end().to_string();
-
-                // Skip empty lines to avoid clutter
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Some(state) = &app_state_stdout {
-                    state.add_log(name_str.clone(), line.clone(), false).await;
-                } else {
-                    let colored_name = name_str.color(process_color);
-                    let padding = " ".repeat(max_name_len.saturating_sub(name_str.len()));
-                    println!("{colored_name}{padding} | {}", line);
-
-                    // Force immediate output to terminal
-                    use std::io::{Write, stdout};
-                    let _ = stdout().flush();
-
-                    // Write to log file if available
-                    if let Some(log_file) = &log_file_stdout {
-                        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                        let log_line = format!("[{timestamp}] [{name_str}] {line}\n");
-                        let mut file = log_file.lock().await;
-                        let _ = file.write_all(log_line.as_bytes());
-                        let _ = file.flush();
-                    }
-                }
-            }
-        });
-
-        // Store stdout handle
+        // Store handles in runtime state
         {
             let mut runtime = self.runtime.lock().await;
             let handles = runtime
@@ -446,52 +418,6 @@ impl ProcessManager {
                 .entry(name.to_string())
                 .or_insert_with(Vec::new);
             handles.push(stdout_handle);
-        }
-
-        let name_str = name.to_string();
-        let stderr_reader = BufReader::new(stderr);
-        let app_state_stderr = app_state;
-
-        let stderr_handle = tokio::spawn(async move {
-            let mut lines = stderr_reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim_end().to_string();
-
-                // Skip empty lines to avoid clutter
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Some(state) = &app_state_stderr {
-                    state.add_log(name_str.clone(), line.clone(), true).await;
-                } else {
-                    let colored_name = name_str.color(process_color);
-                    let padding = " ".repeat(max_name_len.saturating_sub(name_str.len()));
-                    println!("{colored_name}{padding} | {}", line);
-
-                    // Force immediate output to terminal
-                    use std::io::{Write, stdout};
-                    let _ = stdout().flush();
-
-                    // Write to log file if available
-                    if let Some(log_file) = &log_file {
-                        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                        let log_line = format!("[{timestamp}] [STDERR] [{name_str}] {line}\n");
-                        let mut file = log_file.lock().await;
-                        let _ = file.write_all(log_line.as_bytes());
-                        let _ = file.flush();
-                    }
-                }
-            }
-        });
-
-        // Store stderr handle
-        {
-            let mut runtime = self.runtime.lock().await;
-            let handles = runtime
-                .output_handles
-                .entry(name.to_string())
-                .or_insert_with(Vec::new);
             handles.push(stderr_handle);
         }
     }
@@ -1139,7 +1065,7 @@ impl ProcessManager {
 
     /// Get a color for a process (consistent assignment).
     pub fn get_process_color(index: usize) -> colored::Color {
-        PROCESS_COLORS[index % PROCESS_COLORS.len()]
+        output::get_process_color(index)
     }
 
     // -----------------------------------------------------------------------
@@ -1226,16 +1152,13 @@ impl ProcessManager {
             .all(|info| info.status == ProcessStatus::Stopped)
     }
 
-    /// Format a system message with proper alignment.
+    /// Format and print a system message with proper alignment.
     async fn print_system_message(&self, message: &str) {
         let max_name_len = {
             let config = self.config.lock().await;
             config.max_name_length.max(5) // Ensure at least 5 for "gaffa"
         };
-        let colored_gaffa = "gaffa".magenta();
-        let padding = " ".repeat(max_name_len.saturating_sub(5));
-        let colored_msg = message.magenta();
-        println!("{colored_gaffa}{padding} | {colored_msg}");
+        println!("{}", output::format_gaffa_message(message, max_name_len));
     }
 }
 

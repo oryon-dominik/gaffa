@@ -1,4 +1,5 @@
 pub mod constants;
+pub mod output;
 pub mod platform;
 mod process_manager;
 pub mod procfile;
