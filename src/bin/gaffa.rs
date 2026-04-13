@@ -396,6 +396,9 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
     #[cfg(windows)]
     install_console_ctrl_handler();
 
+    // Ensure console ANSI support is active from the start.
+    gaffa::platform::ensure_console_mode();
+
     let procfile_path = run_matches
         .get_one::<String>("procfile")
         .map(String::as_str)

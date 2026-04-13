@@ -156,6 +156,45 @@ pub mod windows {
         }
         None
     }
+
+    /// Ensure the console output mode has the flags required for correct ANSI
+    /// escape-code interpretation and newline translation (`\n` → `\r\n`).
+    ///
+    /// On Windows, Ctrl+C can corrupt the console mode, disabling
+    /// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and `ENABLE_PROCESSED_OUTPUT`.
+    /// Calling this before every line of coloured output guarantees the
+    /// terminal renders ANSI sequences instead of showing raw `←[94m` garbage.
+    ///
+    /// The check is cheap (one `GetConsoleMode` syscall); `SetConsoleMode` is
+    /// only called when the flags are actually missing.
+    pub fn ensure_console_mode() {
+        use winapi::shared::minwindef::DWORD;
+        use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+        const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
+        const ENABLE_WRAP_AT_EOL_OUTPUT: DWORD = 0x0002;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+        const REQUIRED_FLAGS: DWORD =
+            ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+
+        unsafe {
+            for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let handle = GetStdHandle(std_handle);
+                if handle.is_null() {
+                    continue;
+                }
+                let mut mode: DWORD = 0;
+                // GetConsoleMode fails for redirected handles — skip those.
+                if GetConsoleMode(handle, &mut mode) != 0 && (mode & REQUIRED_FLAGS != REQUIRED_FLAGS)
+                {
+                    mode |= REQUIRED_FLAGS;
+                    let _ = SetConsoleMode(handle, mode);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -217,6 +256,9 @@ pub mod unix {
         }
         None
     }
+
+    /// No-op on Unix — ANSI escape codes are natively supported.
+    pub fn ensure_console_mode() {}
 }
 
 // Re-export the appropriate module based on the target OS

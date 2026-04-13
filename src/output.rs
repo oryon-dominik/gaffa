@@ -42,6 +42,10 @@ pub fn spawn_output_handlers(
                     .add_log(stdout_name.clone(), line.clone(), false)
                     .await;
             } else {
+                // Re-enable VTP before printing — Ctrl+C on Windows can
+                // corrupt the console mode between lines of output.
+                crate::platform::ensure_console_mode();
+
                 let colored_name = stdout_name.color(process_color);
                 let padding = " ".repeat(max_name_len.saturating_sub(stdout_name.len()));
                 println!("{colored_name}{padding} | {}", line);
@@ -79,6 +83,10 @@ pub fn spawn_output_handlers(
             if let Some(state) = &app_state_stderr {
                 state.add_log(stderr_name.clone(), line.clone(), true).await;
             } else {
+                // Re-enable VTP before printing — Ctrl+C on Windows can
+                // corrupt the console mode between lines of output.
+                crate::platform::ensure_console_mode();
+
                 let colored_name = stderr_name.color(process_color);
                 let padding = " ".repeat(max_name_len.saturating_sub(stderr_name.len()));
                 println!("{colored_name}{padding} | {}", line);
