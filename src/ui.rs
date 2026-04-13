@@ -3,9 +3,11 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Instant;
 
-
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,7 +21,8 @@ use ratatui::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-use crate::process_manager::{ProcessError, ProcessManager, ProcessStatus};
+use crate::process_manager::ProcessManager;
+use crate::types::{ProcessError, ProcessStatus};
 
 const MAX_LOG_LINES: usize = 1000;
 const MAX_COMMAND_HISTORY: usize = 100;
@@ -97,7 +100,7 @@ impl Default for AppState {
 struct UIState {
     logs: VecDeque<LogEntry>,
     input: String,
-    cursor_position: usize,                 // Track cursor position within input
+    cursor_position: usize, // Track cursor position within input
     command_history: Vec<String>,
     history_index: Option<usize>,
     process_status: Vec<String>,
@@ -378,34 +381,37 @@ pub async fn run_terminal_ui(
                     manager_for_commands
                         .stop_all_with_state(Some(state_for_commands.clone()))
                         .await;
-                    
+
                     // Fix any processes that were terminated but status wasn't updated
                     {
                         let mut processes = manager_for_commands.processes.lock().await;
                         let children = manager_for_commands.children.lock().await;
                         for (name, info) in processes.iter_mut() {
-                            if info.status == ProcessStatus::Running && !children.contains_key(name) {
+                            if info.status == ProcessStatus::Running && !children.contains_key(name)
+                            {
                                 // Process is marked as running but has no child - it must have been terminated
                                 info.status = ProcessStatus::Stopped;
                                 info.stopped_at = Some(std::time::Instant::now());
                             }
                         }
-                        
                     }
-                    
+
                     // Wait for all processes to actually stop
                     let timeout = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {
                         let all_stopped = {
                             let processes = manager_for_commands.processes.lock().await;
                             // Only check processes that were actually running (not those that were never started)
-                            let running_processes: Vec<_> = processes.values()
+                            let running_processes: Vec<_> = processes
+                                .values()
                                 .filter(|info| info.last_restart.is_some()) // Only processes that were started
                                 .collect();
-                            
-                            running_processes.iter().all(|info| info.status == ProcessStatus::Stopped)
+
+                            running_processes
+                                .iter()
+                                .all(|info| info.status == ProcessStatus::Stopped)
                         };
-                        
+
                         if all_stopped {
                             state_for_commands
                                 .add_system_log("All processes stopped. Exiting...".to_string())
@@ -421,17 +427,20 @@ pub async fn run_terminal_ui(
                             let _ = shutdown_tx.send(());
                             break; // Exit immediately after showing messages
                         }
-                        
+
                         if std::time::Instant::now() > timeout {
                             state_for_commands
-                                .add_system_log("Timeout waiting for processes to stop. Forcing exit...".to_string())
+                                .add_system_log(
+                                    "Timeout waiting for processes to stop. Forcing exit..."
+                                        .to_string(),
+                                )
                                 .await;
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             // Signal UI to exit even on timeout
                             let _ = shutdown_tx.send(());
                             break;
                         }
-                        
+
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     break;
@@ -456,18 +465,18 @@ pub async fn run_terminal_ui(
 
     // Store any final state we need before cleanup
     let _should_show_summary = true; // We always want to show summary after interactive mode
-    
+
     // Cleanup terminal immediately
     cleanup_terminal();
-    
+
     // Ensure output is flushed and terminal is ready for normal output
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    
+
     // Add a delay to ensure terminal state is fully restored
     std::thread::sleep(std::time::Duration::from_millis(200));
-    
+
     // Return with a flag indicating summary should be shown
     Ok(())
 }
@@ -475,35 +484,31 @@ pub async fn run_terminal_ui(
 #[allow(clippy::needless_pass_by_value)]
 // Terminal cleanup function that MUST be called
 fn cleanup_terminal() {
-    use std::io::{Write, stdout, stderr};
-    
+    use std::io::{Write, stderr, stdout};
+
     // First, ensure we show the cursor
     let _ = execute!(stdout(), crossterm::cursor::Show);
-    
+
     // Disable raw mode - this is critical for restoring terminal
     let _ = disable_raw_mode();
-    
+
     // Leave alternate screen and disable mouse capture
-    let _ = execute!(
-        stdout(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-    );
-    
+    let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture,);
+
     // Reset all text attributes to default
     let _ = execute!(
         stdout(),
         crossterm::style::ResetColor,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
     );
-    
+
     // Force flush both stdout and stderr
     let _ = stdout().flush();
     let _ = stderr().flush();
-    
+
     // Give the terminal time to process all the commands
     std::thread::sleep(std::time::Duration::from_millis(50));
-    
+
     // Platform-specific terminal restoration
     #[cfg(unix)]
     {
@@ -511,7 +516,7 @@ fn cleanup_terminal() {
         use std::process::Command;
         let _ = Command::new("stty").arg("sane").status();
     }
-    
+
     #[cfg(windows)]
     {
         // On Windows, reset console mode
@@ -519,11 +524,10 @@ fn cleanup_terminal() {
         use winapi::um::processenv::GetStdHandle;
         use winapi::um::winbase::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
         use winapi::um::wincon::{
-            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-            ENABLE_PROCESSED_OUTPUT, ENABLE_WRAP_AT_EOL_OUTPUT,
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT,
         };
-        
+
         unsafe {
             // Reset input handle
             let input_handle = GetStdHandle(STD_INPUT_HANDLE);
@@ -531,14 +535,15 @@ fn cleanup_terminal() {
                 let input_mode = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
                 SetConsoleMode(input_handle, input_mode);
             }
-            
+
             // Reset output handle
             let output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
             if output_handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
                 let mut current_mode: u32 = 0;
                 if GetConsoleMode(output_handle, &mut current_mode) != 0 {
-                    let output_mode = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | 
-                                    ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                    let output_mode = ENABLE_PROCESSED_OUTPUT
+                        | ENABLE_WRAP_AT_EOL_OUTPUT
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
                     SetConsoleMode(output_handle, output_mode);
                 }
             }
@@ -599,7 +604,7 @@ fn run_ui_loop(
 
     // Always restore terminal, even on error
     cleanup_terminal();
-    
+
     // Restore original panic handler
     let _ = std::panic::take_hook();
 
@@ -799,7 +804,7 @@ fn run_app<B: Backend>(
                 _ => {}
             }
         }
-        
+
         let mut should_redraw = false;
 
         // Update UI state with latest logs
@@ -886,7 +891,7 @@ fn run_app<B: Backend>(
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-            // Force redraw for time updates when status is visible
+        // Force redraw for time updates when status is visible
         if ui_state.show_status && last_redraw.elapsed() > std::time::Duration::from_millis(100) {
             should_redraw = true;
         }
@@ -980,7 +985,7 @@ fn render_logs(f: &mut Frame, area: Rect, ui_state: &mut UIState) {
         .take(visible_height)
         .map(|entry| {
             use ratatui::text::{Line, Span};
-            
+
             let process_color = if entry.process == "gaffa" {
                 Color::Magenta
             } else {
@@ -993,24 +998,22 @@ fn render_logs(f: &mut Frame, area: Rect, ui_state: &mut UIState) {
             // Create a line with colored process name and appropriately colored content
             let line = if entry.process == "gaffa" {
                 // For gaffa messages, color the entire line magenta
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:>12} | {}", entry.process, entry.content),
-                        Style::default().fg(Color::Magenta)
-                    ),
-                ])
+                Line::from(vec![Span::styled(
+                    format!("{:>12} | {}", entry.process, entry.content),
+                    Style::default().fg(Color::Magenta),
+                )])
             } else {
                 // For process output, only color the process name
                 Line::from(vec![
                     Span::styled(
                         format!("{:>12}", entry.process),
-                        Style::default().fg(process_color)
+                        Style::default().fg(process_color),
                     ),
                     Span::raw(" | "),
                     Span::raw(&entry.content),
                 ])
             };
-            
+
             ListItem::new(line)
         })
         .collect();
@@ -1055,9 +1058,10 @@ fn render_process_status(f: &mut Frame, area: Rect, ui_state: &UIState) {
             } else {
                 Color::White
             };
-            
+
             // Get the actual process color from the map
-            let name_color = ui_state.process_colors
+            let name_color = ui_state
+                .process_colors
                 .get(name)
                 .copied()
                 .unwrap_or(Color::Cyan);
@@ -1076,8 +1080,11 @@ fn render_process_status(f: &mut Frame, area: Rect, ui_state: &UIState) {
         }
     }
 
-    let status =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Status--ps---|----status----|--------restarts--------|---runtime----"));
+    let status = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Status--ps---|----status----|--------restarts--------|---runtime----"),
+    );
 
     f.render_widget(status, area);
 }

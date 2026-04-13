@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
-use regex::Regex;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command as TokioCommand},
@@ -14,105 +13,13 @@ use tokio::{
 
 use crate::constants::*;
 use crate::platform::{configure_command, force_kill_process, terminate_process};
+use crate::procfile;
+use crate::types::*;
 use crate::ui::AppState;
 use crate::ui_wrapper::run_interactive_ui;
 
-pub type Result<T> = std::result::Result<T, ProcessError>;
-
-#[derive(Debug, thiserror::Error)]
-pub enum ProcessError {
-    #[error("Failed to read Procfile '{path}': {source}")]
-    ProcfileRead {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[error("Invalid Procfile line format: '{line}'")]
-    InvalidFormat { line: String },
-
-    #[error("No valid processes found in Procfile")]
-    NoProcesses,
-
-    #[error("Process '{name}' not found")]
-    ProcessNotFound { name: String },
-
-    #[error("Process '{name}' is already running")]
-    ProcessAlreadyRunning { name: String },
-
-    #[error("Process '{name}' is not running")]
-    ProcessNotRunning { name: String },
-
-    #[error("Failed to parse command '{command}': {source}")]
-    CommandParse {
-        command: String,
-        source: shell_words::ParseError,
-    },
-
-    #[error("Empty command for process '{name}'")]
-    EmptyCommand { name: String },
-
-    #[error("Failed to spawn process '{name}': {source}")]
-    ProcessSpawn {
-        name: String,
-        source: std::io::Error,
-    },
-
-    #[error("Error reading input: {0}")]
-    InputRead(std::io::Error),
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcessInfo {
-    pub command: String,
-    pub status: ProcessStatus,
-    pub restart_count: u32,
-    pub last_restart: Option<Instant>,
-    pub stopped_at: Option<Instant>,
-    pub cumulative_runtime: Duration,
-    pub exit_code: Option<i32>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProcessStatus {
-    Running,
-    Stopped,
-    Restarting,
-}
-
-/// Parse environment variables from a file.
-pub async fn parse_env_file(path: &str, env_vars: &mut HashMap<String, String>) -> Result<()> {
-    let contents = tokio::fs::read_to_string(path).await
-        .map_err(|e| ProcessError::ProcfileRead { 
-            path: path.to_string(), 
-            source: e 
-        })?;
-    
-    for line in contents.lines() {
-        let line = line.trim();
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        
-        // Parse KEY=VALUE
-        if let Some((key, value)) = line.split_once('=') {
-            env_vars.insert(key.trim().to_string(), value.trim().to_string());
-        }
-    }
-    
-    Ok(())
-}
-
-impl std::fmt::Display for ProcessStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status_str = match self {
-            Self::Running => "RUNNING".green(),
-            Self::Stopped => "STOPPED".yellow(),
-            Self::Restarting => "RESTARTING".blue(),
-        };
-        write!(f, "{status_str}")
-    }
-}
+// Re-export for backward compatibility
+pub use crate::procfile::parse_env_file;
 
 /// Manages multiple processes defined in a Procfile.
 ///
@@ -151,7 +58,7 @@ impl ProcessManager {
         let mut file_lock = self.log_file.lock().await;
         *file_lock = Some(log_file);
     }
-    
+
     /// Set environment variables to be applied to all processes.
     pub async fn set_environment_variables(&self, env_vars: HashMap<String, String>) {
         let mut env_lock = self.environment_variables.lock().await;
@@ -166,75 +73,17 @@ impl ProcessManager {
     /// - The Procfile cannot be read
     /// - The Procfile contains invalid format
     /// - No valid processes are found
-    ///
-    /// # Panics
-    ///
-    /// Panics if the regex pattern is invalid (should never happen with hardcoded pattern).
     pub async fn load_procfile(&self, procfile_path: &str) -> Result<()> {
-        let content =
-            std::fs::read_to_string(procfile_path).map_err(|e| ProcessError::ProcfileRead {
-                path: procfile_path.to_string(),
-                source: e,
-            })?;
+        let data = procfile::parse_procfile(procfile_path)?;
 
-        let re = Regex::new(r"^(\w+):\s+(.*)$").expect("Valid regex pattern");
         let mut processes = self.processes.lock().await;
+        *processes = data.processes;
+
         let mut colors = self.process_colors.lock().await;
-        let mut name_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut color_index = 0;
+        *colors = data.colors;
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Some(caps) = re.captures(line) {
-                let base_name = caps[1].to_string();
-                let command = caps[2].to_string();
-
-                // Handle duplicate names by appending a number
-                let count = name_counts.entry(base_name.clone()).or_insert(0);
-                *count += 1;
-
-                let name = if *count == 1 {
-                    base_name.clone()
-                } else {
-                    format!("{base_name}.{count}")
-                };
-
-                processes.insert(
-                    name.clone(),
-                    ProcessInfo {
-                        command,
-                        status: ProcessStatus::Stopped,
-                        restart_count: 0,
-                        last_restart: None,
-                        stopped_at: None,
-                        cumulative_runtime: Duration::ZERO,
-                        exit_code: None,
-                    },
-                );
-
-                // Assign color to process
-                colors.insert(name.clone(), Self::get_process_color(color_index));
-                color_index += 1;
-            } else {
-                return Err(ProcessError::InvalidFormat {
-                    line: line.to_string(),
-                });
-            }
-        }
-
-        if processes.is_empty() {
-            return Err(ProcessError::NoProcesses);
-        }
-
-        // Calculate maximum process name length
-        let max_len = processes.keys().map(|name| name.len()).max().unwrap_or(0);
         let mut max_name_length = self.max_name_length.lock().await;
-        *max_name_length = max_len;
+        *max_name_length = data.max_name_length;
 
         Ok(())
     }
@@ -247,7 +96,7 @@ impl ProcessManager {
     pub async fn start_process(&self, name: &str) -> Result<()> {
         self.start_process_with_state(name, None).await
     }
-    
+
     /// Start a process without logging messages (for non-interactive mode).
     pub async fn start_process_quietly(&self, name: &str) -> Result<()> {
         self.start_process_internal(name, None, false).await
@@ -265,7 +114,7 @@ impl ProcessManager {
     ) -> Result<()> {
         self.start_process_internal(name, app_state, true).await
     }
-    
+
     /// Internal method to start a process with optional logging.
     async fn start_process_internal(
         &self,
@@ -282,7 +131,7 @@ impl ProcessManager {
                 });
             }
         }
-        
+
         let process_info = {
             let mut processes = self.processes.lock().await;
             match processes.get_mut(name) {
@@ -379,9 +228,8 @@ impl ProcessManager {
         } else {
             cmd.stdin(Stdio::null());
         }
-        
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // Configure platform-specific command options
         configure_command(&mut cmd);
@@ -457,8 +305,12 @@ impl ProcessManager {
                             let exit_msg = match exit_code {
                                 Some(0) => format!("Process '{name_str}' exited cleanly"),
                                 Some(-1) => format!("Process '{name_str}' terminated gracefully"), // Force terminated
-                                Some(EXIT_CODE_KEYBOARD_INTERRUPT) => format!("Process '{name_str}' interrupted gracefully"), // KeyboardInterrupt
-                                Some(EXIT_CODE_CTRL_C_WINDOWS) => format!("Process '{name_str}' interrupted gracefully"), // CTRL_C_EVENT on Windows
+                                Some(EXIT_CODE_KEYBOARD_INTERRUPT) => {
+                                    format!("Process '{name_str}' interrupted gracefully")
+                                } // KeyboardInterrupt
+                                Some(EXIT_CODE_CTRL_C_WINDOWS) => {
+                                    format!("Process '{name_str}' interrupted gracefully")
+                                } // CTRL_C_EVENT on Windows
                                 Some(code) => {
                                     format!("Process '{name_str}' exited with code {code}")
                                 }
@@ -475,7 +327,7 @@ impl ProcessManager {
                 }
             }
         });
-        
+
         // Store the monitor handle so it can be aborted if needed
         {
             let mut monitor_handles = self.monitor_handles.lock().await;
@@ -513,12 +365,12 @@ impl ProcessManager {
             let mut lines = stdout_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim_end().to_string();
-                
+
                 // Skip empty lines to avoid clutter
                 if line.is_empty() {
                     continue;
                 }
-                
+
                 if let Some(state) = &app_state_stdout {
                     state.add_log(name_str.clone(), line.clone(), false).await;
                 } else {
@@ -527,7 +379,7 @@ impl ProcessManager {
                     println!("{colored_name}{padding} | {}", line);
 
                     // Force immediate output to terminal
-                    use std::io::{stdout, Write};
+                    use std::io::{Write, stdout};
                     let _ = stdout().flush();
 
                     // Write to log file if available
@@ -541,11 +393,13 @@ impl ProcessManager {
                 }
             }
         });
-        
+
         // Store stdout handle
         {
             let mut output_handles = self.output_handles.lock().await;
-            let handles = output_handles.entry(name.to_string()).or_insert_with(Vec::new);
+            let handles = output_handles
+                .entry(name.to_string())
+                .or_insert_with(Vec::new);
             handles.push(stdout_handle);
         }
 
@@ -557,12 +411,12 @@ impl ProcessManager {
             let mut lines = stderr_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim_end().to_string();
-                
+
                 // Skip empty lines to avoid clutter
                 if line.is_empty() {
                     continue;
                 }
-                
+
                 if let Some(state) = &app_state_stderr {
                     state.add_log(name_str.clone(), line.clone(), true).await;
                 } else {
@@ -571,7 +425,7 @@ impl ProcessManager {
                     println!("{colored_name}{padding} | {}", line);
 
                     // Force immediate output to terminal
-                    use std::io::{stdout, Write};
+                    use std::io::{Write, stdout};
                     let _ = stdout().flush();
 
                     // Write to log file if available
@@ -585,11 +439,13 @@ impl ProcessManager {
                 }
             }
         });
-        
+
         // Store stderr handle
         {
             let mut output_handles = self.output_handles.lock().await;
-            let handles = output_handles.entry(name.to_string()).or_insert_with(Vec::new);
+            let handles = output_handles
+                .entry(name.to_string())
+                .or_insert_with(Vec::new);
             handles.push(stderr_handle);
         }
     }
@@ -615,7 +471,7 @@ impl ProcessManager {
     ) -> Result<()> {
         self.stop_process_internal(name, app_state, true).await
     }
-    
+
     /// Internal method to stop a process with optional logging.
     async fn stop_process_internal(
         &self,
@@ -634,7 +490,7 @@ impl ProcessManager {
                     .await;
             }
         }
-        
+
         let mut children = self.children.lock().await;
 
         if let Some(mut child) = children.remove(name) {
@@ -644,18 +500,22 @@ impl ProcessManager {
             if exit_code.is_none() {
                 // Put it back in the children map since it's still running
                 children.insert(name.to_string(), child);
-                
+
                 if log_messages {
                     if let Some(state) = &app_state {
                         state
-                            .add_system_log(format!("Process '{name}' is ignoring termination signals"))
+                            .add_system_log(format!(
+                                "Process '{name}' is ignoring termination signals"
+                            ))
                             .await;
                     } else {
-                        self.print_system_message(&format!("Process '{name}' is ignoring termination signals"))
-                            .await;
+                        self.print_system_message(&format!(
+                            "Process '{name}' is ignoring termination signals"
+                        ))
+                        .await;
                     }
                 }
-                
+
                 // Don't return error - the process is still running but stubborn
                 // This allows restart to work properly
                 return Ok(());
@@ -668,7 +528,7 @@ impl ProcessManager {
                     handle.abort();
                 }
             }
-            
+
             // Abort all output handles for this process
             {
                 let mut output_handles = self.output_handles.lock().await;
@@ -751,10 +611,12 @@ impl ProcessManager {
             self.print_system_message(&format!("Restarting process '{name}'..."))
                 .await;
         }
-        
+
         // Try to stop the process quietly (we already announced the restart)
-        let stop_result = self.stop_process_internal(name, app_state.clone(), false).await;
-        
+        let stop_result = self
+            .stop_process_internal(name, app_state.clone(), false)
+            .await;
+
         // If stop failed (process might be stubborn), force kill it for restart
         if stop_result.is_ok() {
             // Process stopped gracefully, just wait a bit
@@ -765,7 +627,7 @@ impl ProcessManager {
             if let Some(mut child) = children.remove(name) {
                 // Force kill the stubborn process for restart
                 let _ = force_kill_process(&mut child).await;
-                
+
                 // Clean up handles
                 {
                     let mut monitor_handles = self.monitor_handles.lock().await;
@@ -781,29 +643,33 @@ impl ProcessManager {
                         }
                     }
                 }
-                
+
                 // Update process status
                 let mut processes = self.processes.lock().await;
                 if let Some(info) = processes.get_mut(name) {
                     info.status = ProcessStatus::Stopped;
                     info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
                 }
-                
+
                 // Log the force kill
                 if let Some(state) = &app_state {
                     state
-                        .add_system_log(format!("Force killed stubborn process '{name}' for restart"))
+                        .add_system_log(format!(
+                            "Force killed stubborn process '{name}' for restart"
+                        ))
                         .await;
                 } else {
-                    self.print_system_message(&format!("Force killed stubborn process '{name}' for restart"))
-                        .await;
+                    self.print_system_message(&format!(
+                        "Force killed stubborn process '{name}' for restart"
+                    ))
+                    .await;
                 }
-                
+
                 // Wait a bit after force kill
                 sleep(Duration::from_millis(500)).await;
             }
         }
-        
+
         // Start the process quietly (we already announced the restart)
         self.start_process_internal(name, app_state, false).await
     }
@@ -812,7 +678,7 @@ impl ProcessManager {
     pub async fn stop_all(&self) {
         self.stop_all_with_state(None).await;
     }
-    
+
     /// Send Ctrl+C to all running processes without stopping them.
     pub async fn send_ctrl_c_to_all(&self) {
         #[cfg(target_os = "windows")]
@@ -822,20 +688,20 @@ impl ProcessManager {
                 if let Some(pid) = child.id() {
                     self.print_system_message(&format!("Sending interrupt signal to '{name}'..."))
                         .await;
-                    
+
                     // On Windows, try multiple approaches
                     // First try Ctrl+C event
                     unsafe {
-                        use winapi::um::wincon::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
+                        use winapi::um::wincon::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
                         let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
                     }
-                    
+
                     // Small delay
                     tokio::time::sleep(INITIAL_CHECK_INTERVAL).await;
-                    
+
                     // Try Ctrl+Break as alternative
                     unsafe {
-                        use winapi::um::wincon::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+                        use winapi::um::wincon::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
                         let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
                     }
                 }
@@ -889,20 +755,21 @@ impl ProcessManager {
             let manager = self.clone();
             let app_state_clone = app_state.clone();
             let name_clone = name.clone();
-            
+
             let task = tokio::spawn(async move {
                 // Try graceful shutdown with a generous timeout (without individual logging)
                 let result = tokio::time::timeout(
                     GRACEFUL_SHUTDOWN_TIMEOUT,
-                    manager.stop_process_internal(&name_clone, app_state_clone, false)
-                ).await;
-                
+                    manager.stop_process_internal(&name_clone, app_state_clone, false),
+                )
+                .await;
+
                 match result {
                     Ok(Ok(())) => (name_clone, true),
                     _ => (name_clone, false),
                 }
             });
-            
+
             shutdown_tasks.push(task);
         }
 
@@ -920,10 +787,9 @@ impl ProcessManager {
         if !failed_shutdowns.is_empty() {
             let remaining: Vec<(String, Child)> = {
                 let mut children = self.children.lock().await;
-                failed_shutdowns.into_iter()
-                    .filter_map(|name| {
-                        children.remove(&name).map(|child| (name, child))
-                    })
+                failed_shutdowns
+                    .into_iter()
+                    .filter_map(|name| children.remove(&name).map(|child| (name, child)))
                     .collect()
             };
 
@@ -931,7 +797,7 @@ impl ProcessManager {
             for (name, mut child) in remaining {
                 // Force kill without waiting
                 let _ = force_kill_process(&mut child).await;
-                
+
                 // Abort the monitor handle for this process
                 {
                     let mut monitor_handles = self.monitor_handles.lock().await;
@@ -939,7 +805,7 @@ impl ProcessManager {
                         handle.abort();
                     }
                 }
-                
+
                 // Abort all output handles for this process
                 {
                     let mut output_handles = self.output_handles.lock().await;
@@ -949,7 +815,7 @@ impl ProcessManager {
                         }
                     }
                 }
-                
+
                 // Update process status
                 let mut processes = self.processes.lock().await;
                 if let Some(info) = processes.get_mut(&name) {
@@ -1123,8 +989,10 @@ impl ProcessManager {
                         )
                         .await;
                 } else {
-                    self.print_system_message("Usage: start <name> - Start a specific stopped process")
-                        .await;
+                    self.print_system_message(
+                        "Usage: start <name> - Start a specific stopped process",
+                    )
+                    .await;
                 }
                 return Err(ProcessError::InputRead(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1144,8 +1012,10 @@ impl ProcessManager {
                 if let Some(state) = &app_state {
                     state.add_system_log("Usage: stop <name> or stop all - Stop a specific process or all processes".to_string()).await;
                 } else {
-                    self.print_system_message("Usage: stop <name> or stop all - Stop a specific process or all processes")
-                        .await;
+                    self.print_system_message(
+                        "Usage: stop <name> or stop all - Stop a specific process or all processes",
+                    )
+                    .await;
                 }
                 return Err(ProcessError::InputRead(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1194,11 +1064,31 @@ impl ProcessManager {
         let processes = self.processes.lock().await;
         processes.keys().cloned().collect()
     }
-    
+
     /// Get the maximum process name length for alignment.
     pub async fn get_max_name_length(&self) -> usize {
         let max_len = self.max_name_length.lock().await;
         (*max_len).max(5) // Ensure at least 5 for "gaffa"
+    }
+
+    /// Get the number of active monitor handles (for diagnostics/testing).
+    pub async fn monitor_handle_count(&self) -> usize {
+        self.monitor_handles.lock().await.len()
+    }
+
+    /// Get the number of active output handles (for diagnostics/testing).
+    pub async fn output_handle_count(&self) -> usize {
+        self.output_handles
+            .lock()
+            .await
+            .values()
+            .map(|v| v.len())
+            .sum()
+    }
+
+    /// Get the number of active child processes (for diagnostics/testing).
+    pub async fn children_count(&self) -> usize {
+        self.children.lock().await.len()
     }
 
     /// Get a color for a process (consistent assignment).
@@ -1217,7 +1107,6 @@ impl ProcessManager {
         let colored_msg = message.magenta();
         println!("{colored_gaffa}{padding} | {colored_msg}");
     }
-
 }
 
 impl Default for ProcessManager {
@@ -1389,5 +1278,4 @@ mod tests {
         let result = manager.handle_command("").await;
         assert!(result.is_ok());
     }
-
 }

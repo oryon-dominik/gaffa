@@ -1,6 +1,8 @@
 pub mod constants;
 pub mod platform;
 mod process_manager;
+pub mod procfile;
+pub mod types;
 pub mod ui;
 mod ui_wrapper;
 
@@ -8,6 +10,6 @@ mod ui_wrapper;
 mod tests;
 
 // Re-export main types and functions
-pub use process_manager::{
-    parse_env_file, ProcessError, ProcessInfo, ProcessManager, ProcessStatus, Result,
-};
+pub use process_manager::ProcessManager;
+pub use procfile::parse_env_file;
+pub use types::{ProcessError, ProcessInfo, ProcessStatus, Result};
