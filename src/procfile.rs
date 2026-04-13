@@ -28,7 +28,7 @@ pub fn parse_procfile(procfile_path: &str) -> Result<ProcfileData> {
             source: e,
         })?;
 
-    let re = Regex::new(r"^(\w+):\s+(.*)$").expect("Valid regex pattern");
+    let re = Regex::new(r"^([\w-]+):\s+(.*)$").expect("Valid regex pattern");
     let mut processes = HashMap::new();
     let mut colors = HashMap::new();
     let mut name_counts: HashMap<String, usize> = HashMap::new();
