@@ -42,10 +42,7 @@ fn reset_terminal() {
     use std::io::Write;
 
     // Show cursor first
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::cursor::Show
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
 
     // Disable raw mode
     let _ = crossterm::terminal::disable_raw_mode();
@@ -73,14 +70,14 @@ fn reset_terminal() {
 /// Simple terminal cleanup for non-interactive mode
 fn reset_terminal_simple() {
     use std::io::Write;
-    
+
     // Just ensure cursor is visible and colors are reset
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::cursor::Show,
         crossterm::style::ResetColor
     );
-    
+
     // Flush output
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -111,10 +108,11 @@ fn show_help() {
 async fn run_non_interactive(
     manager: Arc<ProcessManager>,
     processes_to_run: Option<Vec<String>>,
-) -> Result<bool> { // Returns true if interrupted
-    use tokio::signal;
+) -> Result<bool> {
+    // Returns true if interrupted
     use std::sync::atomic::{AtomicBool, Ordering};
-    
+    use tokio::signal;
+
     let interrupted = Arc::new(AtomicBool::new(false));
 
     // Get max name length for proper alignment
@@ -127,14 +125,20 @@ async fn run_non_interactive(
         manager.process_names().await.len()
     };
 
-    println!("{}", format_system_message_with_padding(
-        &format!("Loading {} processes from procfile", process_count),
-        max_name_len
-    ));
-    println!("{}", format_system_message_with_padding(
-        "Press 'q' or Ctrl+C to stop all processes",
-        max_name_len
-    ));
+    println!(
+        "{}",
+        format_system_message_with_padding(
+            &format!("Loading {} processes from procfile", process_count),
+            max_name_len
+        )
+    );
+    println!(
+        "{}",
+        format_system_message_with_padding(
+            "Press 'q' or Ctrl+C to stop all processes",
+            max_name_len
+        )
+    );
 
     // Spawn signal handler
     tokio::spawn({
@@ -174,16 +178,25 @@ async fn run_non_interactive(
     // Start processes
     if let Some(names) = processes_to_run {
         for name in names {
-            println!("{}", format_system_message_with_padding(
-                &format!("Starting process '{}'...", name),
-                max_name_len
-            ));
+            println!(
+                "{}",
+                format_system_message_with_padding(
+                    &format!("Starting process '{}'...", name),
+                    max_name_len
+                )
+            );
             // Ensure the message is flushed before starting the process
             use std::io::Write;
             let _ = std::io::stdout().flush();
-            
+
             if let Err(e) = manager.start_process_quietly(&name).await {
-                eprintln!("{}", format_error_message_with_padding(&format!("Failed to start process '{}': {}", name, e), max_name_len));
+                eprintln!(
+                    "{}",
+                    format_error_message_with_padding(
+                        &format!("Failed to start process '{}': {}", name, e),
+                        max_name_len
+                    )
+                );
                 return Err(e);
             }
         }
@@ -191,16 +204,25 @@ async fn run_non_interactive(
         // Start all processes
         let process_names = manager.process_names().await;
         for name in process_names {
-            println!("{}", format_system_message_with_padding(
-                &format!("Starting process '{}'...", name),
-                max_name_len
-            ));
+            println!(
+                "{}",
+                format_system_message_with_padding(
+                    &format!("Starting process '{}'...", name),
+                    max_name_len
+                )
+            );
             // Ensure the message is flushed before starting the process
             use std::io::Write;
             let _ = std::io::stdout().flush();
-            
+
             if let Err(e) = manager.start_process_quietly(&name).await {
-                eprintln!("{}", format_error_message_with_padding(&format!("Failed to start process '{}': {}", name, e), max_name_len));
+                eprintln!(
+                    "{}",
+                    format_error_message_with_padding(
+                        &format!("Failed to start process '{}': {}", name, e),
+                        max_name_len
+                    )
+                );
                 return Err(e);
             }
         }
@@ -216,35 +238,40 @@ async fn run_non_interactive(
 
         let all_stopped = {
             let processes = manager.processes.lock().await;
-            processes.values().all(|info| info.status == gaffa::ProcessStatus::Stopped)
+            processes
+                .values()
+                .all(|info| info.status == gaffa::ProcessStatus::Stopped)
         };
 
         if all_stopped {
             break;
         }
     }
-    
+
     let was_interrupted = interrupted.load(Ordering::SeqCst);
-    
+
     // If interrupted, wait a bit for child process output to settle
     if was_interrupted {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        
+
         // Print interrupt message
         let max_name_len = manager.get_max_name_length().await;
-        println!("{}", format_system_message_with_padding(
-            "Interrupt received, stopping processes gracefully...",
-            max_name_len
-        ));
+        println!(
+            "{}",
+            format_system_message_with_padding(
+                "Interrupt received, stopping processes gracefully...",
+                max_name_len
+            )
+        );
     }
-    
+
     show_termination_summary(&manager, was_interrupted).await;
-    
+
     if was_interrupted {
         tokio::time::sleep(Duration::from_millis(100)).await;
         std::process::exit(130);
     }
-    
+
     Ok(interrupted.load(Ordering::SeqCst))
 }
 
@@ -263,7 +290,10 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
     eprintln!("{}", "-".repeat(42));
 
     for (name, info) in processes.iter() {
-        let color = process_colors.get(name).copied().unwrap_or(colored::Color::White);
+        let color = process_colors
+            .get(name)
+            .copied()
+            .unwrap_or(colored::Color::White);
         let name_colored = name.color(color);
 
         // Calculate runtime
@@ -302,7 +332,8 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
 
         // Format with proper alignment
         let name_padding = " ".repeat(max_name_len.saturating_sub(name.len()));
-        eprintln!("   {}{} {:>12} {:>12}",
+        eprintln!(
+            "   {}{} {:>12} {:>12}",
             name_colored,
             name_padding,
             status_str.yellow(),
@@ -339,9 +370,17 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
                 env_vars.insert(key.to_string(), value.to_string());
             } else {
                 // We don't have max_name_len yet, so use default formatting
-                eprintln!("{}", format_error_message(&format!("Invalid environment variable format: {}", env_arg)));
+                eprintln!(
+                    "{}",
+                    format_error_message(&format!(
+                        "Invalid environment variable format: {}",
+                        env_arg
+                    ))
+                );
                 eprintln!("{}", format_error_message("Expected format: KEY=VALUE"));
-                return Err(ProcessError::InvalidFormat { line: env_arg.clone() });
+                return Err(ProcessError::InvalidFormat {
+                    line: env_arg.clone(),
+                });
             }
         }
     }
@@ -435,7 +474,6 @@ async fn main() {
         reset_terminal();
         original_panic(info);
     }));
-    
 
     let app = Command::new("gaffa")
         .version(env!("CARGO_PKG_VERSION"))
