@@ -195,10 +195,10 @@ pub async fn run_terminal_ui(
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
-            let processes = manager_for_status.processes.lock().await;
+            let runtime = manager_for_status.runtime.lock().await;
             let mut status_lines = vec![];
 
-            for (name, info) in processes.iter() {
+            for (name, info) in runtime.processes.iter() {
                 // Calculate total runtime including current session if running
                 let total_runtime = if info.status == ProcessStatus::Running {
                     if let Some(start_time) = info.last_restart {
@@ -383,34 +383,13 @@ pub async fn run_terminal_ui(
                         .await;
 
                     // Fix any processes that were terminated but status wasn't updated
-                    {
-                        let mut processes = manager_for_commands.processes.lock().await;
-                        let children = manager_for_commands.children.lock().await;
-                        for (name, info) in processes.iter_mut() {
-                            if info.status == ProcessStatus::Running && !children.contains_key(name)
-                            {
-                                // Process is marked as running but has no child - it must have been terminated
-                                info.status = ProcessStatus::Stopped;
-                                info.stopped_at = Some(std::time::Instant::now());
-                            }
-                        }
-                    }
+                    manager_for_commands.fix_orphaned_process_status().await;
 
                     // Wait for all processes to actually stop
                     let timeout = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {
-                        let all_stopped = {
-                            let processes = manager_for_commands.processes.lock().await;
-                            // Only check processes that were actually running (not those that were never started)
-                            let running_processes: Vec<_> = processes
-                                .values()
-                                .filter(|info| info.last_restart.is_some()) // Only processes that were started
-                                .collect();
-
-                            running_processes
-                                .iter()
-                                .all(|info| info.status == ProcessStatus::Stopped)
-                        };
+                        let all_stopped =
+                            manager_for_commands.all_started_processes_stopped().await;
 
                         if all_stopped {
                             state_for_commands
@@ -832,7 +811,7 @@ fn run_app<B: Backend>(
                 should_redraw = true;
 
                 // Sync colors from ProcessManager
-                if let Ok(manager_colors) = manager.process_colors.try_lock() {
+                if let Some(manager_colors) = manager.try_get_colors() {
                     let processes: Vec<(String, Option<colored::Color>)> = ui_state
                         .logs
                         .iter()

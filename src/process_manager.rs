@@ -18,23 +18,36 @@ use crate::types::*;
 use crate::ui::AppState;
 use crate::ui_wrapper::run_interactive_ui;
 
-// Re-export for backward compatibility
-pub use crate::procfile::parse_env_file;
+/// Configuration set during initialization. Rarely changes after load.
+pub(crate) struct ProcessConfig {
+    pub colors: HashMap<String, colored::Color>,
+    pub max_name_length: usize,
+    pub env_vars: HashMap<String, String>,
+    pub log_file: Option<Arc<Mutex<std::fs::File>>>,
+}
+
+/// Mutable runtime state for all managed processes.
+pub(crate) struct RuntimeState {
+    pub processes: HashMap<String, ProcessInfo>,
+    pub children: HashMap<String, Child>,
+    pub monitor_handles: HashMap<String, tokio::task::JoinHandle<()>>,
+    pub output_handles: HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
+}
 
 /// Manages multiple processes defined in a Procfile.
 ///
 /// Provides functionality to start, stop, restart, and monitor processes
 /// with interactive control capabilities.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProcessManager {
-    pub processes: Arc<Mutex<HashMap<String, ProcessInfo>>>,
-    pub children: Arc<Mutex<HashMap<String, Child>>>,
-    pub process_colors: Arc<Mutex<HashMap<String, colored::Color>>>,
-    log_file: Arc<Mutex<Option<Arc<Mutex<std::fs::File>>>>>,
-    max_name_length: Arc<Mutex<usize>>,
-    environment_variables: Arc<Mutex<HashMap<String, String>>>,
-    monitor_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    output_handles: Arc<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
+    pub(crate) config: Arc<Mutex<ProcessConfig>>,
+    pub(crate) runtime: Arc<Mutex<RuntimeState>>,
+}
+
+impl std::fmt::Debug for ProcessManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessManager").finish()
+    }
 }
 
 impl ProcessManager {
@@ -42,27 +55,31 @@ impl ProcessManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            processes: Arc::new(Mutex::new(HashMap::new())),
-            children: Arc::new(Mutex::new(HashMap::new())),
-            process_colors: Arc::new(Mutex::new(HashMap::new())),
-            log_file: Arc::new(Mutex::new(None)),
-            max_name_length: Arc::new(Mutex::new(0)),
-            environment_variables: Arc::new(Mutex::new(HashMap::new())),
-            monitor_handles: Arc::new(Mutex::new(HashMap::new())),
-            output_handles: Arc::new(Mutex::new(HashMap::new())),
+            config: Arc::new(Mutex::new(ProcessConfig {
+                colors: HashMap::new(),
+                max_name_length: 0,
+                env_vars: HashMap::new(),
+                log_file: None,
+            })),
+            runtime: Arc::new(Mutex::new(RuntimeState {
+                processes: HashMap::new(),
+                children: HashMap::new(),
+                monitor_handles: HashMap::new(),
+                output_handles: HashMap::new(),
+            })),
         }
     }
 
     /// Set the log file for this process manager.
     pub async fn set_log_file(&self, log_file: Arc<Mutex<std::fs::File>>) {
-        let mut file_lock = self.log_file.lock().await;
-        *file_lock = Some(log_file);
+        let mut config = self.config.lock().await;
+        config.log_file = Some(log_file);
     }
 
     /// Set environment variables to be applied to all processes.
     pub async fn set_environment_variables(&self, env_vars: HashMap<String, String>) {
-        let mut env_lock = self.environment_variables.lock().await;
-        *env_lock = env_vars;
+        let mut config = self.config.lock().await;
+        config.env_vars = env_vars;
     }
 
     /// Load process definitions from a Procfile.
@@ -76,14 +93,13 @@ impl ProcessManager {
     pub async fn load_procfile(&self, procfile_path: &str) -> Result<()> {
         let data = procfile::parse_procfile(procfile_path)?;
 
-        let mut processes = self.processes.lock().await;
-        *processes = data.processes;
+        let mut config = self.config.lock().await;
+        config.colors = data.colors;
+        config.max_name_length = data.max_name_length;
+        drop(config);
 
-        let mut colors = self.process_colors.lock().await;
-        *colors = data.colors;
-
-        let mut max_name_length = self.max_name_length.lock().await;
-        *max_name_length = data.max_name_length;
+        let mut runtime = self.runtime.lock().await;
+        runtime.processes = data.processes;
 
         Ok(())
     }
@@ -124,8 +140,8 @@ impl ProcessManager {
     ) -> Result<()> {
         // Check if process is actually running (exists in children map)
         {
-            let children = self.children.lock().await;
-            if children.contains_key(name) {
+            let runtime = self.runtime.lock().await;
+            if runtime.children.contains_key(name) {
                 return Err(ProcessError::ProcessAlreadyRunning {
                     name: name.to_string(),
                 });
@@ -133,8 +149,8 @@ impl ProcessManager {
         }
 
         let process_info = {
-            let mut processes = self.processes.lock().await;
-            match processes.get_mut(name) {
+            let mut runtime = self.runtime.lock().await;
+            match runtime.processes.get_mut(name) {
                 Some(info) => {
                     info.status = ProcessStatus::Restarting;
                     info.clone()
@@ -148,20 +164,18 @@ impl ProcessManager {
         };
 
         // Add startup message (if requested)
-        if log_messages {
-            if let Some(state) = &app_state {
-                state
-                    .add_log(name.to_string(), format!("Starting '{name}'..."), false)
-                    .await;
-            }
+        if log_messages && let Some(state) = &app_state {
+            state
+                .add_log(name.to_string(), format!("Starting '{name}'..."), false)
+                .await;
         }
 
         self.spawn_process_with_state(name, &process_info.command, app_state.clone())
             .await?;
 
         {
-            let mut processes = self.processes.lock().await;
-            if let Some(info) = processes.get_mut(name) {
+            let mut runtime = self.runtime.lock().await;
+            if let Some(info) = runtime.processes.get_mut(name) {
                 info.status = ProcessStatus::Running;
                 // Only increment restart count if this was previously started
                 if info.last_restart.is_some() || info.cumulative_runtime.as_secs() > 0 {
@@ -215,11 +229,12 @@ impl ProcessManager {
         cmd.args(args);
 
         // Apply environment variables
-        let env_vars = self.environment_variables.lock().await;
-        for (key, value) in env_vars.iter() {
-            cmd.env(key, value);
+        {
+            let config = self.config.lock().await;
+            for (key, value) in config.env_vars.iter() {
+                cmd.env(key, value);
+            }
         }
-        drop(env_vars);
 
         // Only inherit stdin in non-interactive mode
         // In interactive mode (when app_state is Some), the TUI needs exclusive stdin access
@@ -242,24 +257,23 @@ impl ProcessManager {
         let stdout = child.stdout.take().expect("stdout pipe");
         let stderr = child.stderr.take().expect("stderr pipe");
 
-        // Get log file from manager
+        // Get log file from config
         let log_file = {
-            let log_file_lock = self.log_file.lock().await;
-            log_file_lock.clone()
+            let config = self.config.lock().await;
+            config.log_file.clone()
         };
 
         self.spawn_output_handler_with_state(name, stdout, stderr, app_state.clone(), log_file)
             .await;
 
         {
-            let mut children = self.children.lock().await;
-            children.insert(name.to_string(), child);
+            let mut runtime = self.runtime.lock().await;
+            runtime.children.insert(name.to_string(), child);
         }
 
         // Spawn a task to monitor the process exit
         let name_str = name.to_string();
-        let processes = Arc::clone(&self.processes);
-        let children = Arc::clone(&self.children);
+        let runtime_arc = Arc::clone(&self.runtime);
         let app_state_monitor = app_state;
 
         let monitor_handle = tokio::spawn(async move {
@@ -277,19 +291,17 @@ impl ProcessManager {
                     check_interval = check_interval.saturating_mul(2).min(MAX_CHECK_INTERVAL);
                 }
 
-                let mut children_lock = children.lock().await;
-                if let Some(child) = children_lock.get_mut(&name_str) {
+                let mut runtime = runtime_arc.lock().await;
+                if let Some(child) = runtime.children.get_mut(&name_str) {
                     if let Ok(Some(status)) = child.try_wait() {
                         // Process has exited
                         let exit_code = status.code();
 
                         // Remove from children map
-                        children_lock.remove(&name_str);
-                        drop(children_lock);
+                        runtime.children.remove(&name_str);
 
                         // Update process info
-                        let mut processes_lock = processes.lock().await;
-                        if let Some(info) = processes_lock.get_mut(&name_str) {
+                        if let Some(info) = runtime.processes.get_mut(&name_str) {
                             if let Some(start_time) = info.last_restart {
                                 let session_runtime = start_time.elapsed();
                                 info.cumulative_runtime += session_runtime;
@@ -298,7 +310,7 @@ impl ProcessManager {
                             info.stopped_at = Some(Instant::now());
                             info.exit_code = exit_code;
                         }
-                        drop(processes_lock);
+                        drop(runtime);
 
                         // Log the exit
                         if let Some(state) = &app_state_monitor {
@@ -330,8 +342,10 @@ impl ProcessManager {
 
         // Store the monitor handle so it can be aborted if needed
         {
-            let mut monitor_handles = self.monitor_handles.lock().await;
-            monitor_handles.insert(name.to_string(), monitor_handle);
+            let mut runtime = self.runtime.lock().await;
+            runtime
+                .monitor_handles
+                .insert(name.to_string(), monitor_handle);
         }
 
         Ok(())
@@ -346,16 +360,18 @@ impl ProcessManager {
         app_state: Option<Arc<AppState>>,
         log_file: Option<Arc<Mutex<std::fs::File>>>,
     ) {
-        // Get max name length for alignment
-        let max_name_len = {
-            let max_len = self.max_name_length.lock().await;
-            *max_len
+        // Get max name length and color for alignment
+        let (max_name_len, process_color) = {
+            let config = self.config.lock().await;
+            let max_len = config.max_name_length;
+            let color = config
+                .colors
+                .get(name)
+                .copied()
+                .unwrap_or(colored::Color::White);
+            (max_len, color)
         };
-        // Get the color for this process
-        let process_color = {
-            let colors = self.process_colors.lock().await;
-            colors.get(name).copied().unwrap_or(colored::Color::White)
-        };
+
         let name_str = name.to_string();
         let stdout_reader = BufReader::new(stdout);
         let app_state_stdout = app_state.clone();
@@ -396,8 +412,9 @@ impl ProcessManager {
 
         // Store stdout handle
         {
-            let mut output_handles = self.output_handles.lock().await;
-            let handles = output_handles
+            let mut runtime = self.runtime.lock().await;
+            let handles = runtime
+                .output_handles
                 .entry(name.to_string())
                 .or_insert_with(Vec::new);
             handles.push(stdout_handle);
@@ -442,8 +459,9 @@ impl ProcessManager {
 
         // Store stderr handle
         {
-            let mut output_handles = self.output_handles.lock().await;
-            let handles = output_handles
+            let mut runtime = self.runtime.lock().await;
+            let handles = runtime
+                .output_handles
                 .entry(name.to_string())
                 .or_insert_with(Vec::new);
             handles.push(stderr_handle);
@@ -491,15 +509,21 @@ impl ProcessManager {
             }
         }
 
-        let mut children = self.children.lock().await;
+        // Take the child out of the runtime
+        let maybe_child = {
+            let mut runtime = self.runtime.lock().await;
+            runtime.children.remove(name)
+        };
 
-        if let Some(mut child) = children.remove(name) {
-            let exit_code = self.terminate_process(&mut child).await;
+        if let Some(mut child) = maybe_child {
+            let exit_code = self.terminate_child_process(&mut child).await;
 
             // If process didn't terminate gracefully, it's still running
             if exit_code.is_none() {
                 // Put it back in the children map since it's still running
-                children.insert(name.to_string(), child);
+                let mut runtime = self.runtime.lock().await;
+                runtime.children.insert(name.to_string(), child);
+                drop(runtime);
 
                 if log_messages {
                     if let Some(state) = &app_state {
@@ -521,34 +545,28 @@ impl ProcessManager {
                 return Ok(());
             }
 
-            // Abort the monitor handle for this process
+            // Abort the monitor and output handles for this process
             {
-                let mut monitor_handles = self.monitor_handles.lock().await;
-                if let Some(handle) = monitor_handles.remove(name) {
+                let mut runtime = self.runtime.lock().await;
+                if let Some(handle) = runtime.monitor_handles.remove(name) {
                     handle.abort();
                 }
-            }
-
-            // Abort all output handles for this process
-            {
-                let mut output_handles = self.output_handles.lock().await;
-                if let Some(handles) = output_handles.remove(name) {
+                if let Some(handles) = runtime.output_handles.remove(name) {
                     for handle in handles {
                         handle.abort();
                     }
                 }
-            }
 
-            let mut processes = self.processes.lock().await;
-            if let Some(info) = processes.get_mut(name) {
-                // Calculate and add the runtime for this session
-                if let Some(start_time) = info.last_restart {
-                    let session_runtime = start_time.elapsed();
-                    info.cumulative_runtime += session_runtime;
+                if let Some(info) = runtime.processes.get_mut(name) {
+                    // Calculate and add the runtime for this session
+                    if let Some(start_time) = info.last_restart {
+                        let session_runtime = start_time.elapsed();
+                        info.cumulative_runtime += session_runtime;
+                    }
+                    info.status = ProcessStatus::Stopped;
+                    info.stopped_at = Some(Instant::now());
+                    info.exit_code = exit_code;
                 }
-                info.status = ProcessStatus::Stopped;
-                info.stopped_at = Some(Instant::now());
-                info.exit_code = exit_code;
             }
 
             // Log to UI if available (if requested)
@@ -573,7 +591,7 @@ impl ProcessManager {
 
     /// Terminate a child process with platform-specific handling.
     /// Returns the exit code if available.
-    async fn terminate_process(&self, child: &mut Child) -> Option<i32> {
+    async fn terminate_child_process(&self, child: &mut Child) -> Option<i32> {
         // Try to get exit status first (in case process already exited)
         if let Ok(Some(status)) = child.try_wait() {
             return status.code();
@@ -623,32 +641,30 @@ impl ProcessManager {
             sleep(Duration::from_millis(200)).await;
         } else {
             // Process might be stubborn or already stopped, check if it's still in children
-            let mut children = self.children.lock().await;
-            if let Some(mut child) = children.remove(name) {
+            let maybe_child = {
+                let mut runtime = self.runtime.lock().await;
+                runtime.children.remove(name)
+            };
+
+            if let Some(mut child) = maybe_child {
                 // Force kill the stubborn process for restart
                 let _ = force_kill_process(&mut child).await;
 
-                // Clean up handles
+                // Clean up handles and update process status
                 {
-                    let mut monitor_handles = self.monitor_handles.lock().await;
-                    if let Some(handle) = monitor_handles.remove(name) {
+                    let mut runtime = self.runtime.lock().await;
+                    if let Some(handle) = runtime.monitor_handles.remove(name) {
                         handle.abort();
                     }
-                }
-                {
-                    let mut output_handles = self.output_handles.lock().await;
-                    if let Some(handles) = output_handles.remove(name) {
+                    if let Some(handles) = runtime.output_handles.remove(name) {
                         for handle in handles {
                             handle.abort();
                         }
                     }
-                }
-
-                // Update process status
-                let mut processes = self.processes.lock().await;
-                if let Some(info) = processes.get_mut(name) {
-                    info.status = ProcessStatus::Stopped;
-                    info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
+                    if let Some(info) = runtime.processes.get_mut(name) {
+                        info.status = ProcessStatus::Stopped;
+                        info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
+                    }
                 }
 
                 // Log the force kill
@@ -681,42 +697,44 @@ impl ProcessManager {
 
     /// Send Ctrl+C to all running processes without stopping them.
     pub async fn send_ctrl_c_to_all(&self) {
-        #[cfg(target_os = "windows")]
-        {
-            let children = self.children.lock().await;
-            for (name, child) in children.iter() {
-                if let Some(pid) = child.id() {
-                    self.print_system_message(&format!("Sending interrupt signal to '{name}'..."))
-                        .await;
+        // Collect PIDs first, then drop the lock before async work
+        let pids: Vec<(String, u32)> = {
+            let runtime = self.runtime.lock().await;
+            runtime
+                .children
+                .iter()
+                .filter_map(|(name, child)| child.id().map(|pid| (name.clone(), pid)))
+                .collect()
+        };
 
-                    // On Windows, try multiple approaches
-                    // First try Ctrl+C event
-                    unsafe {
-                        use winapi::um::wincon::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
-                        let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
-                    }
+        for (name, pid) in pids {
+            #[cfg(target_os = "windows")]
+            {
+                self.print_system_message(&format!("Sending interrupt signal to '{name}'..."))
+                    .await;
 
-                    // Small delay
-                    tokio::time::sleep(INITIAL_CHECK_INTERVAL).await;
+                // On Windows, try multiple approaches
+                // First try Ctrl+C event
+                unsafe {
+                    use winapi::um::wincon::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
+                    let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
+                }
 
-                    // Try Ctrl+Break as alternative
-                    unsafe {
-                        use winapi::um::wincon::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
-                        let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-                    }
+                // Small delay
+                tokio::time::sleep(INITIAL_CHECK_INTERVAL).await;
+
+                // Try Ctrl+Break as alternative
+                unsafe {
+                    use winapi::um::wincon::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+                    let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
                 }
             }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let children = self.children.lock().await;
-            for (name, child) in children.iter() {
-                if let Some(pid) = child.id() {
-                    self.print_system_message(&format!("Sending SIGINT to '{name}'..."))
-                        .await;
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGINT);
-                    }
+            #[cfg(not(target_os = "windows"))]
+            {
+                self.print_system_message(&format!("Sending SIGINT to '{name}'..."))
+                    .await;
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGINT);
                 }
             }
         }
@@ -726,8 +744,9 @@ impl ProcessManager {
     pub async fn stop_all_with_state(&self, app_state: Option<Arc<AppState>>) {
         // Get all RUNNING processes, not just those with children
         let process_names: Vec<String> = {
-            let processes = self.processes.lock().await;
-            processes
+            let runtime = self.runtime.lock().await;
+            runtime
+                .processes
                 .iter()
                 .filter(|(_, info)| info.status == ProcessStatus::Running)
                 .map(|(name, _)| name.clone())
@@ -776,20 +795,20 @@ impl ProcessManager {
         // Wait for all shutdown tasks to complete
         let mut failed_shutdowns = Vec::new();
         for task in shutdown_tasks {
-            if let Ok((name, success)) = task.await {
-                if !success {
-                    failed_shutdowns.push(name);
-                }
+            if let Ok((name, success)) = task.await
+                && !success
+            {
+                failed_shutdowns.push(name);
             }
         }
 
         // Force cleanup any processes that failed graceful shutdown
         if !failed_shutdowns.is_empty() {
             let remaining: Vec<(String, Child)> = {
-                let mut children = self.children.lock().await;
+                let mut runtime = self.runtime.lock().await;
                 failed_shutdowns
                     .into_iter()
-                    .filter_map(|name| children.remove(&name).map(|child| (name, child)))
+                    .filter_map(|name| runtime.children.remove(&name).map(|child| (name, child)))
                     .collect()
             };
 
@@ -798,27 +817,17 @@ impl ProcessManager {
                 // Force kill without waiting
                 let _ = force_kill_process(&mut child).await;
 
-                // Abort the monitor handle for this process
-                {
-                    let mut monitor_handles = self.monitor_handles.lock().await;
-                    if let Some(handle) = monitor_handles.remove(&name) {
+                // Clean up handles and update process status
+                let mut runtime = self.runtime.lock().await;
+                if let Some(handle) = runtime.monitor_handles.remove(&name) {
+                    handle.abort();
+                }
+                if let Some(handles) = runtime.output_handles.remove(&name) {
+                    for handle in handles {
                         handle.abort();
                     }
                 }
-
-                // Abort all output handles for this process
-                {
-                    let mut output_handles = self.output_handles.lock().await;
-                    if let Some(handles) = output_handles.remove(&name) {
-                        for handle in handles {
-                            handle.abort();
-                        }
-                    }
-                }
-
-                // Update process status
-                let mut processes = self.processes.lock().await;
-                if let Some(info) = processes.get_mut(&name) {
+                if let Some(info) = runtime.processes.get_mut(&name) {
                     info.status = ProcessStatus::Stopped;
                     info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
                 }
@@ -836,12 +845,12 @@ impl ProcessManager {
 
     /// Display current status of all processes with optional UI state.
     pub async fn show_status_with_state(&self, app_state: Option<Arc<AppState>>) {
-        let processes = self.processes.lock().await;
+        let runtime = self.runtime.lock().await;
 
         if let Some(state) = app_state {
             let mut status_lines = vec![];
 
-            for (name, info) in processes.iter() {
+            for (name, info) in runtime.processes.iter() {
                 let uptime = match info.status {
                     ProcessStatus::Running => info.last_restart.map_or_else(
                         || "N/A".to_string(),
@@ -866,7 +875,7 @@ impl ProcessManager {
             println!("\n{}", "Process Status:".bold());
             println!("{:-<60}", "");
 
-            for (name, info) in processes.iter() {
+            for (name, info) in runtime.processes.iter() {
                 // Calculate total runtime including current session if running
                 let total_runtime = if info.status == ProcessStatus::Running {
                     if let Some(start_time) = info.last_restart {
@@ -1061,26 +1070,27 @@ impl ProcessManager {
 
     /// Get list of all process names.
     pub async fn process_names(&self) -> Vec<String> {
-        let processes = self.processes.lock().await;
-        processes.keys().cloned().collect()
+        let runtime = self.runtime.lock().await;
+        runtime.processes.keys().cloned().collect()
     }
 
     /// Get the maximum process name length for alignment.
     pub async fn get_max_name_length(&self) -> usize {
-        let max_len = self.max_name_length.lock().await;
-        (*max_len).max(5) // Ensure at least 5 for "gaffa"
+        let config = self.config.lock().await;
+        config.max_name_length.max(5) // Ensure at least 5 for "gaffa"
     }
 
     /// Get the number of active monitor handles (for diagnostics/testing).
     pub async fn monitor_handle_count(&self) -> usize {
-        self.monitor_handles.lock().await.len()
+        self.runtime.lock().await.monitor_handles.len()
     }
 
     /// Get the number of active output handles (for diagnostics/testing).
     pub async fn output_handle_count(&self) -> usize {
-        self.output_handles
+        self.runtime
             .lock()
             .await
+            .output_handles
             .values()
             .map(|v| v.len())
             .sum()
@@ -1088,7 +1098,7 @@ impl ProcessManager {
 
     /// Get the number of active child processes (for diagnostics/testing).
     pub async fn children_count(&self) -> usize {
-        self.children.lock().await.len()
+        self.runtime.lock().await.children.len()
     }
 
     /// Get a color for a process (consistent assignment).
@@ -1096,11 +1106,95 @@ impl ProcessManager {
         PROCESS_COLORS[index % PROCESS_COLORS.len()]
     }
 
+    // -----------------------------------------------------------------------
+    // Accessor methods for external consumers
+    // -----------------------------------------------------------------------
+
+    /// Get a clone of process info for a specific process.
+    pub async fn get_process_info(&self, name: &str) -> Option<ProcessInfo> {
+        let runtime = self.runtime.lock().await;
+        runtime.processes.get(name).cloned()
+    }
+
+    /// Get all process info as a snapshot (name, info, color).
+    pub async fn process_snapshot(&self) -> Vec<(String, ProcessInfo, colored::Color)> {
+        let runtime = self.runtime.lock().await;
+        let config = self.config.lock().await;
+        runtime
+            .processes
+            .iter()
+            .map(|(name, info)| {
+                let color = config
+                    .colors
+                    .get(name)
+                    .copied()
+                    .unwrap_or(colored::Color::White);
+                (name.clone(), info.clone(), color)
+            })
+            .collect()
+    }
+
+    /// Filter processes to only keep the specified names.
+    pub async fn retain_processes(&self, names: &[String]) {
+        let mut runtime = self.runtime.lock().await;
+        runtime.processes.retain(|name, _| names.contains(name));
+    }
+
+    /// Check if all started processes have stopped.
+    pub async fn all_stopped(&self) -> bool {
+        let runtime = self.runtime.lock().await;
+        runtime
+            .processes
+            .values()
+            .all(|info| info.status == ProcessStatus::Stopped)
+    }
+
+    /// Get a snapshot of process colors.
+    pub async fn get_colors(&self) -> HashMap<String, colored::Color> {
+        let config = self.config.lock().await;
+        config.colors.clone()
+    }
+
+    /// Try to get process colors without blocking (for UI render loop).
+    pub fn try_get_colors(&self) -> Option<HashMap<String, colored::Color>> {
+        self.config
+            .try_lock()
+            .ok()
+            .map(|config| config.colors.clone())
+    }
+
+    /// Fix processes that are marked as running but have no child process.
+    /// Used during quit to ensure consistent state.
+    pub async fn fix_orphaned_process_status(&self) {
+        let mut runtime = self.runtime.lock().await;
+        let child_names: Vec<String> = runtime.children.keys().cloned().collect();
+        for (name, info) in runtime.processes.iter_mut() {
+            if info.status == ProcessStatus::Running && !child_names.contains(name) {
+                info.status = ProcessStatus::Stopped;
+                info.stopped_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Check if all started (previously running) processes have stopped.
+    /// Only considers processes that were actually started at some point.
+    pub async fn all_started_processes_stopped(&self) -> bool {
+        let runtime = self.runtime.lock().await;
+        let running_processes: Vec<_> = runtime
+            .processes
+            .values()
+            .filter(|info| info.last_restart.is_some())
+            .collect();
+        running_processes
+            .iter()
+            .all(|info| info.status == ProcessStatus::Stopped)
+    }
+
     /// Format a system message with proper alignment.
     async fn print_system_message(&self, message: &str) {
         let max_name_len = {
-            let max_len = self.max_name_length.lock().await;
-            (*max_len).max(5) // Ensure at least 5 for "gaffa"
+            let config = self.config.lock().await;
+            config.max_name_length.max(5) // Ensure at least 5 for "gaffa"
         };
         let colored_gaffa = "gaffa".magenta();
         let padding = " ".repeat(max_name_len.saturating_sub(5));

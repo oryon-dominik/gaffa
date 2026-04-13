@@ -95,8 +95,10 @@ async fn test_natural_exit_updates_process_status() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Process should be marked as Stopped
-    let processes = manager.processes.lock().await;
-    let info = processes.get("quick").expect("process should exist");
+    let info = manager
+        .get_process_info("quick")
+        .await
+        .expect("process should exist");
     assert_eq!(
         info.status,
         ProcessStatus::Stopped,
@@ -124,9 +126,9 @@ async fn test_natural_exit_removes_from_children() {
 
     // Immediately after start, child should be present
     {
-        let children = manager.children.lock().await;
+        let children_count = manager.children_count().await;
         assert!(
-            children.contains_key("quick"),
+            children_count > 0,
             "child should be in children map right after start"
         );
     }
@@ -333,8 +335,7 @@ async fn test_multiple_restarts_no_handle_accumulation() {
 
     // Verify restart count was tracked
     {
-        let processes = manager.processes.lock().await;
-        let info = processes.get("svc").unwrap();
+        let info = manager.get_process_info("svc").await.unwrap();
         assert_eq!(
             info.restart_count, restart_count,
             "restart count should match number of restarts"
@@ -363,14 +364,12 @@ async fn test_restart_preserves_cumulative_runtime() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Cumulative runtime should include time from before the restart
-    let processes = manager.processes.lock().await;
-    let info = processes.get("svc").unwrap();
+    let info = manager.get_process_info("svc").await.unwrap();
     assert!(
         info.cumulative_runtime >= Duration::from_secs(1),
         "cumulative runtime should include pre-restart time, got {:?}",
         info.cumulative_runtime
     );
-    drop(processes);
 
     // Clean up
     manager.stop_all().await;
@@ -394,8 +393,7 @@ async fn test_stop_process_updates_status_and_exit_code() {
     // Stop the process
     manager.stop_process("svc").await.unwrap();
 
-    let processes = manager.processes.lock().await;
-    let info = processes.get("svc").unwrap();
+    let info = manager.get_process_info("svc").await.unwrap();
 
     assert_eq!(info.status, ProcessStatus::Stopped);
     assert!(
@@ -484,8 +482,8 @@ async fn test_stop_all_stops_multiple_processes() {
         "all children should be gone"
     );
 
-    let processes = manager.processes.lock().await;
-    for (name, info) in processes.iter() {
+    let snapshot = manager.process_snapshot().await;
+    for (name, info, _color) in &snapshot {
         assert_eq!(
             info.status,
             ProcessStatus::Stopped,
@@ -620,8 +618,10 @@ async fn test_fast_output_process_doesnt_block() {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Process should have exited cleanly
-    let processes = manager.processes.lock().await;
-    let info = processes.get("fast").expect("process should exist");
+    let info = manager
+        .get_process_info("fast")
+        .await
+        .expect("process should exist");
     assert_eq!(
         info.status,
         ProcessStatus::Stopped,
@@ -714,8 +714,7 @@ async fn test_process_status_transitions() {
 
     // Initial status: Stopped (loaded but not started)
     {
-        let processes = manager.processes.lock().await;
-        let info = processes.get("svc").unwrap();
+        let info = manager.get_process_info("svc").await.unwrap();
         assert_eq!(info.status, ProcessStatus::Stopped);
         assert_eq!(info.restart_count, 0);
         assert!(info.last_restart.is_none());
@@ -725,8 +724,7 @@ async fn test_process_status_transitions() {
     manager.start_process("svc").await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
-        let processes = manager.processes.lock().await;
-        let info = processes.get("svc").unwrap();
+        let info = manager.get_process_info("svc").await.unwrap();
         assert_eq!(info.status, ProcessStatus::Running);
         assert!(info.last_restart.is_some());
     }
@@ -734,8 +732,7 @@ async fn test_process_status_transitions() {
     // After stop: Stopped
     manager.stop_process("svc").await.unwrap();
     {
-        let processes = manager.processes.lock().await;
-        let info = processes.get("svc").unwrap();
+        let info = manager.get_process_info("svc").await.unwrap();
         assert_eq!(info.status, ProcessStatus::Stopped);
         assert!(info.stopped_at.is_some());
     }
@@ -744,8 +741,7 @@ async fn test_process_status_transitions() {
     manager.start_process("svc").await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
-        let processes = manager.processes.lock().await;
-        let info = processes.get("svc").unwrap();
+        let info = manager.get_process_info("svc").await.unwrap();
         assert_eq!(info.status, ProcessStatus::Running);
         assert!(info.restart_count >= 1);
     }
@@ -769,14 +765,12 @@ async fn test_multiple_processes_independent_lifecycle() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Short should have exited naturally, long might still be running or just finished
-    let processes = manager.processes.lock().await;
-    let short_info = processes.get("short").unwrap();
+    let short_info = manager.get_process_info("short").await.unwrap();
     assert_eq!(
         short_info.status,
         ProcessStatus::Stopped,
         "short-lived process should be stopped"
     );
-    drop(processes);
 
     // Clean up whatever is left
     manager.stop_all().await;

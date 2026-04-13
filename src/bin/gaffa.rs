@@ -236,12 +236,7 @@ async fn run_non_interactive(
             break;
         }
 
-        let all_stopped = {
-            let processes = manager.processes.lock().await;
-            processes
-                .values()
-                .all(|info| info.status == gaffa::ProcessStatus::Stopped)
-        };
+        let all_stopped = manager.all_stopped().await;
 
         if all_stopped {
             break;
@@ -278,8 +273,7 @@ async fn run_non_interactive(
 /// Show termination summary and exit.
 async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bool) {
     let max_name_len = manager.get_max_name_length().await;
-    let processes = manager.processes.lock().await;
-    let process_colors = manager.process_colors.lock().await;
+    let snapshot = manager.process_snapshot().await;
 
     // Print to stderr to ensure it's not buffered and shows immediately
     eprintln!("------ Session terminated, summary: ------");
@@ -289,12 +283,8 @@ async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bo
     eprintln!("     process{}        status       runtime", header_padding);
     eprintln!("{}", "-".repeat(42));
 
-    for (name, info) in processes.iter() {
-        let color = process_colors
-            .get(name)
-            .copied()
-            .unwrap_or(colored::Color::White);
-        let name_colored = name.color(color);
+    for (name, info, color) in &snapshot {
+        let name_colored = name.color(*color);
 
         // Calculate runtime
         let runtime = if let Some(stopped_at) = info.stopped_at {
@@ -414,15 +404,14 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
 
     // Filter processes if specific ones were requested
     if let Some(ref names) = processes_to_run {
-        let mut processes = manager.processes.lock().await;
-        processes.retain(|name, _| names.contains(name));
-
-        // Check if all requested processes exist
+        // Check if all requested processes exist before filtering
+        let current_names = manager.process_names().await;
         for name in names {
-            if !processes.contains_key(name) {
+            if !current_names.contains(name) {
                 return Err(ProcessError::ProcessNotFound { name: name.clone() });
             }
         }
+        manager.retain_processes(names).await;
     }
 
     if interactive {
