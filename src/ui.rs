@@ -21,7 +21,7 @@ use ratatui::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-use crate::process_manager::ProcessManager;
+use crate::process_manager::{LifecycleOptions, ProcessManager};
 use crate::types::{ProcessError, ProcessStatus};
 
 const MAX_LOG_LINES: usize = 1000;
@@ -342,7 +342,10 @@ pub async fn run_terminal_ui(
         // Start the specified processes with UI state
         for process_name in &processes_to_start {
             match manager_for_startup
-                .start_process_with_state(process_name, Some(state_for_startup.clone()))
+                .start_process_with_opts(
+                    process_name,
+                    &LifecycleOptions::with_ui(state_for_startup.clone()),
+                )
                 .await
             {
                 Ok(()) => {
@@ -365,7 +368,10 @@ pub async fn run_terminal_ui(
             match cmd {
                 UICommand::ExecuteCommand(input) => {
                     match manager_for_commands
-                        .handle_command_with_state(&input, Some(state_for_commands.clone()))
+                        .handle_command_with_opts(
+                            &input,
+                            &LifecycleOptions::with_ui(state_for_commands.clone()),
+                        )
                         .await
                     {
                         Ok(()) => {}
@@ -377,9 +383,9 @@ pub async fn run_terminal_ui(
                     }
                 }
                 UICommand::Quit => {
-                    // stop_all_with_state will log the shutdown message
+                    // stop_all_with_opts will log the shutdown message
                     manager_for_commands
-                        .stop_all_with_state(Some(state_for_commands.clone()))
+                        .stop_all_with_opts(&LifecycleOptions::with_ui(state_for_commands.clone()))
                         .await;
 
                     // Fix any processes that were terminated but status wasn't updated

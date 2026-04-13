@@ -10,6 +10,6 @@ mod ui_wrapper;
 mod tests;
 
 // Re-export main types and functions
-pub use process_manager::ProcessManager;
+pub use process_manager::{LifecycleOptions, ProcessManager};
 pub use procfile::parse_env_file;
 pub use types::{ProcessError, ProcessInfo, ProcessStatus, Result};

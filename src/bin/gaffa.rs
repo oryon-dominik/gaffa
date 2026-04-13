@@ -1,6 +1,6 @@
 use clap::{Arg, Command};
 use colored::Colorize;
-use gaffa::{ProcessError, ProcessManager, Result};
+use gaffa::{LifecycleOptions, ProcessError, ProcessManager, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -189,7 +189,10 @@ async fn run_non_interactive(
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
-            if let Err(e) = manager.start_process_quietly(&name).await {
+            if let Err(e) = manager
+                .start_process_with_opts(&name, &LifecycleOptions::quiet())
+                .await
+            {
                 eprintln!(
                     "{}",
                     format_error_message_with_padding(
@@ -215,7 +218,10 @@ async fn run_non_interactive(
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
-            if let Err(e) = manager.start_process_quietly(&name).await {
+            if let Err(e) = manager
+                .start_process_with_opts(&name, &LifecycleOptions::quiet())
+                .await
+            {
                 eprintln!(
                     "{}",
                     format_error_message_with_padding(

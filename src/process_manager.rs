@@ -18,6 +18,48 @@ use crate::types::*;
 use crate::ui::AppState;
 use crate::ui_wrapper::run_interactive_ui;
 
+/// Options for process lifecycle operations.
+///
+/// Replaces the previous pattern of duplicated `_with_state` / `_internal`
+/// methods by bundling the two orthogonal knobs (UI state and logging) into
+/// a single value object.
+pub struct LifecycleOptions {
+    pub app_state: Option<Arc<AppState>>,
+    pub log_messages: bool,
+}
+
+impl LifecycleOptions {
+    /// Default options: no UI, log messages enabled.
+    pub fn new() -> Self {
+        Self {
+            app_state: None,
+            log_messages: true,
+        }
+    }
+
+    /// Quiet mode: no UI, no log messages.
+    pub fn quiet() -> Self {
+        Self {
+            app_state: None,
+            log_messages: false,
+        }
+    }
+
+    /// UI mode: with app state, log messages enabled.
+    pub fn with_ui(state: Arc<AppState>) -> Self {
+        Self {
+            app_state: Some(state),
+            log_messages: true,
+        }
+    }
+}
+
+impl Default for LifecycleOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Configuration set during initialization. Rarely changes after load.
 pub(crate) struct ProcessConfig {
     pub colors: HashMap<String, colored::Color>,
@@ -106,38 +148,22 @@ impl ProcessManager {
 
     /// Start a specific process by name.
     ///
+    /// Convenience wrapper around [`start_process_with_opts`] with default options.
+    ///
     /// # Errors
     ///
     /// Returns an error if the process is already running, not found, or fails to start.
     pub async fn start_process(&self, name: &str) -> Result<()> {
-        self.start_process_with_state(name, None).await
+        self.start_process_with_opts(name, &LifecycleOptions::new())
+            .await
     }
 
-    /// Start a process without logging messages (for non-interactive mode).
-    pub async fn start_process_quietly(&self, name: &str) -> Result<()> {
-        self.start_process_internal(name, None, false).await
-    }
-
-    /// Start a specific process by name with optional UI state.
+    /// Start a specific process by name with explicit lifecycle options.
     ///
     /// # Errors
     ///
     /// Returns an error if the process is already running, not found, or fails to start.
-    pub async fn start_process_with_state(
-        &self,
-        name: &str,
-        app_state: Option<Arc<AppState>>,
-    ) -> Result<()> {
-        self.start_process_internal(name, app_state, true).await
-    }
-
-    /// Internal method to start a process with optional logging.
-    async fn start_process_internal(
-        &self,
-        name: &str,
-        app_state: Option<Arc<AppState>>,
-        log_messages: bool,
-    ) -> Result<()> {
+    pub async fn start_process_with_opts(&self, name: &str, opts: &LifecycleOptions) -> Result<()> {
         // Check if process is actually running (exists in children map)
         {
             let runtime = self.runtime.lock().await;
@@ -164,13 +190,15 @@ impl ProcessManager {
         };
 
         // Add startup message (if requested)
-        if log_messages && let Some(state) = &app_state {
+        if opts.log_messages
+            && let Some(state) = &opts.app_state
+        {
             state
                 .add_log(name.to_string(), format!("Starting '{name}'..."), false)
                 .await;
         }
 
-        self.spawn_process_with_state(name, &process_info.command, app_state.clone())
+        self.spawn_process_with_state(name, &process_info.command, opts.app_state.clone())
             .await?;
 
         {
@@ -188,7 +216,7 @@ impl ProcessManager {
 
         // Don't print to stdout if we have UI state - it's already logged
         // Also don't print if we're not logging messages (non-interactive mode handles it)
-        if app_state.is_none() && log_messages {
+        if opts.app_state.is_none() && opts.log_messages {
             self.print_system_message(&format!("Starting process '{name}'"))
                 .await;
         }
@@ -470,36 +498,25 @@ impl ProcessManager {
 
     /// Stop a specific process by name.
     ///
+    /// Convenience wrapper around [`stop_process_with_opts`] with default options.
+    ///
     /// # Errors
     ///
     /// Returns an error if the process is not running.
     pub async fn stop_process(&self, name: &str) -> Result<()> {
-        self.stop_process_with_state(name, None).await
+        self.stop_process_with_opts(name, &LifecycleOptions::new())
+            .await
     }
 
-    /// Stop a specific process by name with optional UI state.
+    /// Stop a specific process by name with explicit lifecycle options.
     ///
     /// # Errors
     ///
     /// Returns an error if the process is not running.
-    pub async fn stop_process_with_state(
-        &self,
-        name: &str,
-        app_state: Option<Arc<AppState>>,
-    ) -> Result<()> {
-        self.stop_process_internal(name, app_state, true).await
-    }
-
-    /// Internal method to stop a process with optional logging.
-    async fn stop_process_internal(
-        &self,
-        name: &str,
-        app_state: Option<Arc<AppState>>,
-        log_messages: bool,
-    ) -> Result<()> {
+    pub async fn stop_process_with_opts(&self, name: &str, opts: &LifecycleOptions) -> Result<()> {
         // First announce we're stopping the process (if requested)
-        if log_messages {
-            if let Some(state) = &app_state {
+        if opts.log_messages {
+            if let Some(state) = &opts.app_state {
                 state
                     .add_system_log(format!("Stopping process '{name}'..."))
                     .await;
@@ -525,8 +542,8 @@ impl ProcessManager {
                 runtime.children.insert(name.to_string(), child);
                 drop(runtime);
 
-                if log_messages {
-                    if let Some(state) = &app_state {
+                if opts.log_messages {
+                    if let Some(state) = &opts.app_state {
                         state
                             .add_system_log(format!(
                                 "Process '{name}' is ignoring termination signals"
@@ -570,8 +587,8 @@ impl ProcessManager {
             }
 
             // Log to UI if available (if requested)
-            if log_messages {
-                if let Some(state) = &app_state {
+            if opts.log_messages {
+                if let Some(state) = &opts.app_state {
                     state
                         .add_system_log(format!("Stopped process '{name}'"))
                         .await;
@@ -603,25 +620,28 @@ impl ProcessManager {
 
     /// Restart a specific process by name.
     ///
+    /// Convenience wrapper around [`restart_process_with_opts`] with default options.
+    ///
     /// # Errors
     ///
     /// Returns an error if the process cannot be stopped or started.
     pub async fn restart_process(&self, name: &str) -> Result<()> {
-        self.restart_process_with_state(name, None).await
+        self.restart_process_with_opts(name, &LifecycleOptions::new())
+            .await
     }
 
-    /// Restart a specific process by name with optional UI state.
+    /// Restart a specific process by name with explicit lifecycle options.
     ///
     /// # Errors
     ///
     /// Returns an error if the process cannot be stopped or started.
-    pub async fn restart_process_with_state(
+    pub async fn restart_process_with_opts(
         &self,
         name: &str,
-        app_state: Option<Arc<AppState>>,
+        opts: &LifecycleOptions,
     ) -> Result<()> {
         // First announce the restart
-        if let Some(state) = &app_state {
+        if let Some(state) = &opts.app_state {
             state
                 .add_system_log(format!("Restarting process '{name}'..."))
                 .await;
@@ -630,10 +650,14 @@ impl ProcessManager {
                 .await;
         }
 
+        // Build quiet opts (same app_state, but no log messages since we already announced)
+        let quiet_opts = LifecycleOptions {
+            app_state: opts.app_state.clone(),
+            log_messages: false,
+        };
+
         // Try to stop the process quietly (we already announced the restart)
-        let stop_result = self
-            .stop_process_internal(name, app_state.clone(), false)
-            .await;
+        let stop_result = self.stop_process_with_opts(name, &quiet_opts).await;
 
         // If stop failed (process might be stubborn), force kill it for restart
         if stop_result.is_ok() {
@@ -668,7 +692,7 @@ impl ProcessManager {
                 }
 
                 // Log the force kill
-                if let Some(state) = &app_state {
+                if let Some(state) = &opts.app_state {
                     state
                         .add_system_log(format!(
                             "Force killed stubborn process '{name}' for restart"
@@ -687,12 +711,14 @@ impl ProcessManager {
         }
 
         // Start the process quietly (we already announced the restart)
-        self.start_process_internal(name, app_state, false).await
+        self.start_process_with_opts(name, &quiet_opts).await
     }
 
     /// Stop all running processes.
+    ///
+    /// Convenience wrapper around [`stop_all_with_opts`] with default options.
     pub async fn stop_all(&self) {
-        self.stop_all_with_state(None).await;
+        self.stop_all_with_opts(&LifecycleOptions::new()).await;
     }
 
     /// Send Ctrl+C to all running processes without stopping them.
@@ -740,8 +766,8 @@ impl ProcessManager {
         }
     }
 
-    /// Stop all running processes with optional UI state.
-    pub async fn stop_all_with_state(&self, app_state: Option<Arc<AppState>>) {
+    /// Stop all running processes with explicit lifecycle options.
+    pub async fn stop_all_with_opts(&self, opts: &LifecycleOptions) {
         // Get all RUNNING processes, not just those with children
         let process_names: Vec<String> = {
             let runtime = self.runtime.lock().await;
@@ -759,7 +785,7 @@ impl ProcessManager {
         }
 
         // Log that we're starting shutdown
-        if let Some(state) = &app_state {
+        if let Some(state) = &opts.app_state {
             state
                 .add_system_log("Interrupt received, stopping processes gracefully...".to_string())
                 .await;
@@ -772,14 +798,19 @@ impl ProcessManager {
         let mut shutdown_tasks = Vec::new();
         for name in process_names {
             let manager = self.clone();
-            let app_state_clone = app_state.clone();
+            let app_state_clone = opts.app_state.clone();
             let name_clone = name.clone();
 
             let task = tokio::spawn(async move {
+                // Build quiet opts for each parallel task (no individual logging)
+                let quiet_opts = LifecycleOptions {
+                    app_state: app_state_clone,
+                    log_messages: false,
+                };
                 // Try graceful shutdown with a generous timeout (without individual logging)
                 let result = tokio::time::timeout(
                     GRACEFUL_SHUTDOWN_TIMEOUT,
-                    manager.stop_process_internal(&name_clone, app_state_clone, false),
+                    manager.stop_process_with_opts(&name_clone, &quiet_opts),
                 )
                 .await;
 
@@ -839,15 +870,17 @@ impl ProcessManager {
     }
 
     /// Display current status of all processes.
+    ///
+    /// Convenience wrapper around [`show_status_with_opts`] with default options.
     pub async fn show_status(&self) {
-        self.show_status_with_state(None).await;
+        self.show_status_with_opts(&LifecycleOptions::new()).await;
     }
 
-    /// Display current status of all processes with optional UI state.
-    pub async fn show_status_with_state(&self, app_state: Option<Arc<AppState>>) {
+    /// Display current status of all processes with explicit lifecycle options.
+    pub async fn show_status_with_opts(&self, opts: &LifecycleOptions) {
         let runtime = self.runtime.lock().await;
 
-        if let Some(state) = app_state {
+        if let Some(state) = &opts.app_state {
             let mut status_lines = vec![];
 
             for (name, info) in runtime.processes.iter() {
@@ -954,22 +987,25 @@ impl ProcessManager {
 
     /// Handle a single interactive command.
     ///
+    /// Convenience wrapper around [`handle_command_with_opts`] with default options.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command cannot be executed.
     pub async fn handle_command(&self, input: &str) -> Result<()> {
-        self.handle_command_with_state(input, None).await
+        self.handle_command_with_opts(input, &LifecycleOptions::new())
+            .await
     }
 
-    /// Handle a single interactive command with optional UI state.
+    /// Handle a single interactive command with explicit lifecycle options.
     ///
     /// # Errors
     ///
     /// Returns an error if the command cannot be executed.
-    pub async fn handle_command_with_state(
+    pub async fn handle_command_with_opts(
         &self,
         input: &str,
-        app_state: Option<Arc<AppState>>,
+        opts: &LifecycleOptions,
     ) -> Result<()> {
         let parts: Vec<&str> = input.split_whitespace().collect();
 
@@ -977,21 +1013,21 @@ impl ProcessManager {
             ["q" | "quit"] => {
                 // In interactive mode, the UI will handle the quit
                 // In non-interactive mode, we still need to handle it
-                if app_state.is_none() {
+                if opts.app_state.is_none() {
                     // Non-interactive mode - handle quit directly
                     return Ok(());
                 }
                 // Interactive mode - UI will handle the quit via UICommand::Quit
             }
             ["status"] => {
-                self.show_status_with_state(app_state).await;
+                self.show_status_with_opts(opts).await;
             }
             ["start", name] => {
-                self.start_process_with_state(name, app_state).await?;
+                self.start_process_with_opts(name, opts).await?;
             }
             ["start"] => {
                 // Provide helpful error message
-                if let Some(state) = &app_state {
+                if let Some(state) = &opts.app_state {
                     state
                         .add_system_log(
                             "Usage: start <name> - Start a specific stopped process".to_string(),
@@ -1011,14 +1047,14 @@ impl ProcessManager {
             ["s" | "stop", name] => {
                 if *name == "all" {
                     // When user types "stop all", just call stop_all directly
-                    self.stop_all_with_state(app_state).await;
+                    self.stop_all_with_opts(opts).await;
                 } else {
-                    self.stop_process_with_state(name, app_state).await?;
+                    self.stop_process_with_opts(name, opts).await?;
                 }
             }
             ["s" | "stop"] => {
                 // Provide helpful error message
-                if let Some(state) = &app_state {
+                if let Some(state) = &opts.app_state {
                     state.add_system_log("Usage: stop <name> or stop all - Stop a specific process or all processes".to_string()).await;
                 } else {
                     self.print_system_message(
@@ -1032,11 +1068,11 @@ impl ProcessManager {
                 )));
             }
             ["r" | "restart", name] => {
-                self.restart_process_with_state(name, app_state).await?;
+                self.restart_process_with_opts(name, opts).await?;
             }
             ["r" | "restart"] => {
                 // Provide helpful error message
-                if let Some(state) = &app_state {
+                if let Some(state) = &opts.app_state {
                     state
                         .add_system_log(
                             "Usage: restart <name> - Restart a specific process".to_string(),
@@ -1053,7 +1089,7 @@ impl ProcessManager {
             }
             [] => {} // Empty input
             _ if !input.is_empty() => {
-                if app_state.is_none() {
+                if opts.app_state.is_none() {
                     self.print_system_message(&format!("Unknown command: {input}"))
                         .await;
                 }
