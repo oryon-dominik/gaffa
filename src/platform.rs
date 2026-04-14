@@ -159,13 +159,18 @@ pub mod windows {
     /// Ensure the console output mode has the flags required for correct ANSI
     /// escape-code interpretation and newline translation (`\n` → `\r\n`).
     ///
-    /// On Windows, Ctrl+C can corrupt the console mode, disabling
+    /// On Windows, Ctrl+C and child processes that write to the shared
+    /// console can corrupt the mode, disabling
     /// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and `ENABLE_PROCESSED_OUTPUT`.
     /// Calling this before every line of coloured output guarantees the
-    /// terminal renders ANSI sequences instead of showing raw `←[94m` garbage.
+    /// terminal renders ANSI sequences instead of showing raw `←[94m` garbage
+    /// followed by a CP437 `◙` for each unprocessed `\n`.
     ///
-    /// The check is cheap (one `GetConsoleMode` syscall); `SetConsoleMode` is
-    /// only called when the flags are actually missing.
+    /// The flags are set unconditionally rather than gated on
+    /// `GetConsoleMode` — the check used to race with child processes that
+    /// mutated the mode between our read and write, leaving gaffa's output
+    /// garbled during shutdown when children like uvicorn/podman emit their
+    /// own terminal sequences.
     pub fn ensure_console_mode() {
         use winapi::shared::minwindef::DWORD;
         use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
@@ -185,11 +190,10 @@ pub mod windows {
                     continue;
                 }
                 let mut mode: DWORD = 0;
-                // GetConsoleMode fails for redirected handles — skip those.
-                if GetConsoleMode(handle, &mut mode) != 0 && (mode & REQUIRED_FLAGS != REQUIRED_FLAGS)
-                {
-                    mode |= REQUIRED_FLAGS;
-                    let _ = SetConsoleMode(handle, mode);
+                // GetConsoleMode fails for redirected handles — skip those,
+                // they are not a real console and SetConsoleMode would fail.
+                if GetConsoleMode(handle, &mut mode) != 0 {
+                    let _ = SetConsoleMode(handle, mode | REQUIRED_FLAGS);
                 }
             }
         }

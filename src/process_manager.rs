@@ -1177,7 +1177,13 @@ impl ProcessManager {
             let config = self.config.lock().await;
             config.max_name_length.max(5) // Ensure at least 5 for "gaffa"
         };
+        // On Windows, Ctrl+C can leave the console without VT processing
+        // and \n→\r\n translation — re-arm before writing so shutdown
+        // messages don't render as `←[…m` garbage followed by `◙`.
+        crate::platform::ensure_console_mode();
         println!("{}", output::format_gaffa_message(message, max_name_len));
+        use std::io::{Write, stdout};
+        let _ = stdout().flush();
     }
 }
 

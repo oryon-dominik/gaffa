@@ -147,7 +147,8 @@ fn rotate_log_path(path: &str) -> std::path::PathBuf {
 fn print_startup_banner(
     procfile_path: &str,
     process_names: &[String],
-    log_path: Option<&std::path::Path>,
+    log_path_requested: Option<&str>,
+    log_path_rotated: Option<&std::path::Path>,
 ) {
     use colored::Colorize;
 
@@ -160,8 +161,8 @@ fn print_startup_banner(
         ("procfile", procfile_path.to_string()),
         ("processes", procs_value.clone()),
     ];
-    if let Some(p) = log_path {
-        rows.push(("logfile", p.display().to_string()));
+    if let Some(p) = log_path_requested {
+        rows.push(("logfile", p.to_string()));
     }
     rows.push(("controls", "q or Ctrl+C to stop".to_string()));
 
@@ -189,19 +190,17 @@ fn print_startup_banner(
                 5
             )
         );
-        if let Some(p) = log_path {
+        if let Some(p) = log_path_requested {
             println!(
                 "{}",
-                output::format_gaffa_message(
-                    &format!("logging to {}", p.display()),
-                    5
-                )
+                output::format_gaffa_message(&format!("logging to {p}"), 5)
             );
         }
         println!(
             "{}",
             output::format_gaffa_message("q or Ctrl+C to stop", 5)
         );
+        announce_log_rotation(log_path_requested, log_path_rotated);
         return;
     }
 
@@ -223,13 +222,40 @@ fn print_startup_banner(
     }
     println!("  {}", bot.bright_black());
     println!();
+
+    announce_log_rotation(log_path_requested, log_path_rotated);
+}
+
+/// Print a one-line `gaffa │ rotated <requested> → <rotated>` notice when
+/// the actual on-disk file differs from the path the user passed with
+/// `--log-file`. Keeps the banner header clean while making the rotation
+/// observable — grep-friendly and copy-safe.
+fn announce_log_rotation(
+    requested: Option<&str>,
+    rotated: Option<&std::path::Path>,
+) {
+    let (Some(req), Some(rot)) = (requested, rotated) else {
+        return;
+    };
+    let rot_str = rot.display().to_string();
+    // Compare by filename when the rotated path just adds parent dirs; a
+    // true "same path" means rotation was a no-op and there is nothing
+    // to announce.
+    if rot_str == req {
+        return;
+    }
+    println!(
+        "{}",
+        output::format_gaffa_message(&format!("log rotated → {rot_str}"), 5)
+    );
 }
 
 async fn run_non_interactive(
     manager: Arc<ProcessManager>,
     processes_to_run: Option<Vec<String>>,
     procfile_path: &str,
-    log_path: Option<&std::path::Path>,
+    log_path_requested: Option<&str>,
+    log_path_rotated: Option<&std::path::Path>,
 ) -> Result<bool> {
     // Returns true if interrupted
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -247,7 +273,12 @@ async fn run_non_interactive(
         None => manager.process_names().await,
     };
 
-    print_startup_banner(procfile_path, &startup_names, log_path);
+    print_startup_banner(
+        procfile_path,
+        &startup_names,
+        log_path_requested,
+        log_path_rotated,
+    );
 
     // Spawn signal handler
     tokio::spawn({
@@ -706,6 +737,7 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
             manager.clone(),
             processes_to_run,
             procfile_path,
+            log_file_path.map(String::as_str),
             rotated_log_path.as_deref(),
         )
         .await
