@@ -68,6 +68,7 @@ pub(crate) struct ProcessConfig {
     pub max_name_length: usize,
     pub env_vars: HashMap<String, String>,
     pub log_file: Option<Arc<Mutex<std::fs::File>>>,
+    pub shutdown_timeout: Duration,
 }
 
 /// Mutable runtime state for all managed processes.
@@ -104,6 +105,7 @@ impl ProcessManager {
                 max_name_length: 0,
                 env_vars: HashMap::new(),
                 log_file: None,
+                shutdown_timeout: GRACEFUL_SHUTDOWN_TIMEOUT,
             })),
             runtime: Arc::new(Mutex::new(RuntimeState {
                 processes: HashMap::new(),
@@ -118,6 +120,15 @@ impl ProcessManager {
     pub async fn set_log_file(&self, log_file: Arc<Mutex<std::fs::File>>) {
         let mut config = self.config.lock().await;
         config.log_file = Some(log_file);
+    }
+
+    /// Override the graceful shutdown timeout for stop operations.
+    ///
+    /// Caps how long each child has to exit cleanly before gaffa force-kills
+    /// it during `stop_all`. Defaults to [`GRACEFUL_SHUTDOWN_TIMEOUT`].
+    pub async fn set_shutdown_timeout(&self, timeout: Duration) {
+        let mut config = self.config.lock().await;
+        config.shutdown_timeout = timeout;
     }
 
     /// Set environment variables to be applied to all processes.
@@ -555,8 +566,13 @@ impl ProcessManager {
             return status.code();
         }
 
+        let timeout = {
+            let config = self.config.lock().await;
+            config.shutdown_timeout
+        };
+
         // Use platform-specific termination
-        terminate_process(child).await
+        terminate_process(child, timeout).await
     }
 
     /// Restart a specific process by name.
@@ -706,6 +722,11 @@ impl ProcessManager {
             return;
         }
 
+        let shutdown_timeout = {
+            let config = self.config.lock().await;
+            config.shutdown_timeout
+        };
+
         // Log that we're starting shutdown
         if let Some(state) = &opts.app_state {
             state
@@ -729,9 +750,11 @@ impl ProcessManager {
                     app_state: app_state_clone,
                     log_messages: false,
                 };
-                // Try graceful shutdown with a generous timeout (without individual logging)
+                // Try graceful shutdown with the configured timeout (without individual logging).
+                // Add a small cushion so terminate_process's internal deadline fires before this one.
+                let outer_timeout = shutdown_timeout + Duration::from_secs(1);
                 let result = tokio::time::timeout(
-                    GRACEFUL_SHUTDOWN_TIMEOUT,
+                    outer_timeout,
                     manager.stop_process_with_opts(&name_clone, &quiet_opts),
                 )
                 .await;

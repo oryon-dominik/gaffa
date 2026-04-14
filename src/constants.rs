@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 // Process management timeouts
+// Default graceful shutdown timeout — overridable at runtime via
+// `--shutdown-timeout` (see `ProcessManager::set_shutdown_timeout`).
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROCESS_KILL_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SIGTERM_WAIT_TIMEOUT: Duration = Duration::from_secs(5);

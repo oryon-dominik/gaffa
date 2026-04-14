@@ -88,6 +88,8 @@ fn show_help() {
     println!("  -l, --log-file <FILE>     Log output to file");
     println!("      --env <KEY=VALUE>     Set environment variable (can be used multiple times)");
     println!("      --env-file <FILE>     Read environment variables from file");
+    println!("      --shutdown-timeout <SECONDS>");
+    println!("                            Grace period before force-kill (default: 10)");
     println!();
     println!("Arguments:");
     println!("  [PROCESS_NAMES]...       Specific processes to run (runs all if omitted)");
@@ -392,6 +394,49 @@ fn install_console_ctrl_handler() {
     }
 }
 
+/// Ensure the parent directory of a log file exists, prompting the user
+/// to create it if it does not.
+fn ensure_log_parent_dir(path: &str) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let parent = match std::path::Path::new(path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(()),
+    };
+
+    if parent.exists() {
+        return Ok(());
+    }
+
+    eprint!(
+        "Log file directory '{}' does not exist. Create it? [y/N]: ",
+        parent.display()
+    );
+    let _ = std::io::stderr().flush();
+
+    let mut answer = String::new();
+    let stdin = std::io::stdin();
+    let _ = stdin.lock().read_line(&mut answer);
+    let yes = matches!(answer.trim(), "y" | "Y" | "yes" | "YES");
+
+    if !yes {
+        return Err(ProcessError::ProcfileRead {
+            path: path.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("parent directory '{}' does not exist", parent.display()),
+            ),
+        });
+    }
+
+    std::fs::create_dir_all(parent).map_err(|e| ProcessError::ProcfileRead {
+        path: path.to_string(),
+        source: e,
+    })?;
+
+    Ok(())
+}
+
 async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
     #[cfg(windows)]
     install_console_ctrl_handler();
@@ -447,6 +492,13 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
 
     let manager = Arc::new(ProcessManager::new());
 
+    // Apply the configured graceful-shutdown timeout.
+    if let Some(secs) = run_matches.get_one::<u64>("shutdown-timeout") {
+        manager
+            .set_shutdown_timeout(Duration::from_secs(*secs))
+            .await;
+    }
+
     // Set environment variables
     if !env_vars.is_empty() {
         manager.set_environment_variables(env_vars).await;
@@ -454,6 +506,7 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
 
     // Set up log file if specified
     if let Some(path) = log_file_path {
+        ensure_log_parent_dir(path)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -581,6 +634,14 @@ async fn main() {
                         .value_name("FILE")
                         .help("Read environment variables from a file")
                         .action(clap::ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("shutdown-timeout")
+                        .long("shutdown-timeout")
+                        .value_name("SECONDS")
+                        .help("Grace period (seconds) for each process to exit before force-kill (default: 10)")
+                        .default_value("10")
+                        .value_parser(clap::value_parser!(u64).range(1..=3600)),
                 ),
         );
 
