@@ -121,16 +121,27 @@ async fn run_non_interactive(
         manager.process_names().await.len()
     };
 
+    // Collect the set of processes we're about to start so we can announce
+    // them in a single compact banner instead of N identical "Starting" lines.
+    let startup_names: Vec<String> = match &processes_to_run {
+        Some(names) => names.clone(),
+        None => manager.process_names().await,
+    };
+
     println!(
         "{}",
         output::format_gaffa_message(
-            &format!("Loading {} processes from procfile", process_count),
+            &format!(
+                "Starting {} processes: {}",
+                process_count,
+                startup_names.join(", ")
+            ),
             max_name_len
         )
     );
     println!(
         "{}",
-        output::format_gaffa_message("Press 'q' or Ctrl+C to stop all processes", max_name_len)
+        output::format_gaffa_message("Press 'q' or Ctrl+C to stop", max_name_len)
     );
 
     // Spawn signal handler
@@ -168,62 +179,24 @@ async fn run_non_interactive(
         }
     });
 
-    // Start processes
-    if let Some(names) = processes_to_run {
-        for name in names {
-            println!(
+    // Start processes. We announced the full set in a single banner above,
+    // so here we only surface failures — success is implied by subsequent
+    // child output.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    for name in &startup_names {
+        if let Err(e) = manager
+            .start_process_with_opts(name, &LifecycleOptions::quiet())
+            .await
+        {
+            eprintln!(
                 "{}",
-                output::format_gaffa_message(
-                    &format!("Starting process '{}'...", name),
+                output::format_error_message(
+                    &format!("Failed to start process '{}': {}", name, e),
                     max_name_len
                 )
             );
-            // Ensure the message is flushed before starting the process
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-
-            if let Err(e) = manager
-                .start_process_with_opts(&name, &LifecycleOptions::quiet())
-                .await
-            {
-                eprintln!(
-                    "{}",
-                    output::format_error_message(
-                        &format!("Failed to start process '{}': {}", name, e),
-                        max_name_len
-                    )
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        // Start all processes
-        let process_names = manager.process_names().await;
-        for name in process_names {
-            println!(
-                "{}",
-                output::format_gaffa_message(
-                    &format!("Starting process '{}'...", name),
-                    max_name_len
-                )
-            );
-            // Ensure the message is flushed before starting the process
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-
-            if let Err(e) = manager
-                .start_process_with_opts(&name, &LifecycleOptions::quiet())
-                .await
-            {
-                eprintln!(
-                    "{}",
-                    output::format_error_message(
-                        &format!("Failed to start process '{}': {}", name, e),
-                        max_name_len
-                    )
-                );
-                return Err(e);
-            }
+            return Err(e);
         }
     }
 
@@ -283,74 +256,135 @@ async fn run_non_interactive(
 
 /// Show termination summary and exit.
 async fn show_termination_summary(manager: &ProcessManager, _was_interrupted: bool) {
-    let max_name_len = manager.get_max_name_length().await;
+    use colored::Colorize;
+
     let snapshot = manager.process_snapshot().await;
 
-    let table_width = max_name_len + 30;
-
-    eprintln!();
-    eprintln!("{}", "-".repeat(table_width));
-    eprintln!("  Session terminated");
-    eprintln!("{}", "-".repeat(table_width));
-
-    // Simpler header format
-    let header_padding = " ".repeat(max_name_len.saturating_sub(7));
-    eprintln!("  process{}     status        runtime", header_padding);
-    eprintln!("{}", "-".repeat(table_width));
-
-    for (name, info, _color) in &snapshot {
-        // Calculate runtime
-        let runtime = if let Some(stopped_at) = info.stopped_at {
-            if let Some(last_restart) = info.last_restart {
-                stopped_at.duration_since(last_restart)
-            } else {
-                Duration::from_secs(0)
-            }
-        } else if let Some(last_restart) = info.last_restart {
-            last_restart.elapsed()
-        } else {
-            Duration::from_secs(0)
-        };
-
-        // Format runtime string
-        let runtime_str = if runtime.as_millis() == 0 {
-            "N/A".to_string()
-        } else if runtime.as_secs() >= 3600 {
-            let h = runtime.as_secs() / 3600;
-            let m = (runtime.as_secs() % 3600) / 60;
-            let s = runtime.as_secs() % 60;
-            format!("{h}h {m}m {s}s")
-        } else if runtime.as_secs() >= 60 {
-            let m = runtime.as_secs() / 60;
-            let s = runtime.as_secs() % 60;
-            format!("{m}m {s}s")
-        } else if runtime.as_secs() >= 1 {
-            format!("{}s", runtime.as_secs())
-        } else {
-            format!("{}ms", runtime.as_millis())
-        };
-
-        // Determine status based on exit code and status
-        let status_str = match (&info.status, info.exit_code) {
-            (gaffa::ProcessStatus::Running, _) => "running".to_string(),
-            (gaffa::ProcessStatus::Stopped, Some(0)) => "exit 0".to_string(),
-            (gaffa::ProcessStatus::Stopped, Some(-1)) => "terminated".to_string(),
-            (gaffa::ProcessStatus::Stopped, Some(512)) => "interrupted".to_string(),
-            (gaffa::ProcessStatus::Stopped, Some(-1073741510)) => "interrupted".to_string(), // Windows Ctrl+C
-            (gaffa::ProcessStatus::Stopped, Some(code)) => format!("exit {}", code),
-            (gaffa::ProcessStatus::Stopped, None) => "stopped".to_string(),
-            _ => "unknown".to_string(),
-        };
-
-        // Format with proper alignment — plain text, no ANSI colors
-        let name_padding = " ".repeat(max_name_len.saturating_sub(name.len()));
-        eprintln!(
-            "  {}{} {:>12} {:>12}",
-            name, name_padding, status_str, runtime_str
-        );
+    // Build rows up front so we can compute column widths from real content.
+    struct Row {
+        name: String,
+        color: colored::Color,
+        status: String,
+        runtime: String,
     }
 
-    eprintln!("{}", "-".repeat(table_width));
+    let rows: Vec<Row> = snapshot
+        .iter()
+        .map(|(name, info, color)| {
+            let runtime = if let Some(stopped_at) = info.stopped_at {
+                if let Some(last_restart) = info.last_restart {
+                    stopped_at.duration_since(last_restart)
+                } else {
+                    Duration::from_secs(0)
+                }
+            } else if let Some(last_restart) = info.last_restart {
+                last_restart.elapsed()
+            } else {
+                Duration::from_secs(0)
+            };
+
+            let runtime_str = if runtime.as_millis() == 0 {
+                "N/A".to_string()
+            } else if runtime.as_secs() >= 3600 {
+                let h = runtime.as_secs() / 3600;
+                let m = (runtime.as_secs() % 3600) / 60;
+                let s = runtime.as_secs() % 60;
+                format!("{h}h {m}m {s}s")
+            } else if runtime.as_secs() >= 60 {
+                let m = runtime.as_secs() / 60;
+                let s = runtime.as_secs() % 60;
+                format!("{m}m {s}s")
+            } else if runtime.as_secs() >= 1 {
+                format!("{}s", runtime.as_secs())
+            } else {
+                format!("{}ms", runtime.as_millis())
+            };
+
+            let status_str = match (&info.status, info.exit_code) {
+                (gaffa::ProcessStatus::Running, _) => "running".to_string(),
+                (gaffa::ProcessStatus::Stopped, Some(0)) => "exit 0".to_string(),
+                (gaffa::ProcessStatus::Stopped, Some(-1)) => "terminated".to_string(),
+                (gaffa::ProcessStatus::Stopped, Some(512)) => "interrupted".to_string(),
+                (gaffa::ProcessStatus::Stopped, Some(-1073741510)) => {
+                    "interrupted".to_string()
+                }
+                (gaffa::ProcessStatus::Stopped, Some(code)) => format!("exit {code}"),
+                (gaffa::ProcessStatus::Stopped, None) => "stopped".to_string(),
+                _ => "unknown".to_string(),
+            };
+
+            Row {
+                name: name.clone(),
+                color: *color,
+                status: status_str,
+                runtime: runtime_str,
+            }
+        })
+        .collect();
+
+    const H_NAME: &str = "process";
+    const H_STATUS: &str = "status";
+    const H_RUNTIME: &str = "runtime";
+
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_NAME.len());
+    let status_w = rows
+        .iter()
+        .map(|r| r.status.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_STATUS.len());
+    let runtime_w = rows
+        .iter()
+        .map(|r| r.runtime.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_RUNTIME.len());
+
+    // Box-drawing helpers. Each cell has 1 space of left/right padding, so
+    // horizontal segments are `width + 2` wide.
+    let seg = |w: usize| "─".repeat(w + 2);
+    let top = format!("╭{}┬{}┬{}╮", seg(name_w), seg(status_w), seg(runtime_w));
+    let mid = format!("├{}┼{}┼{}┤", seg(name_w), seg(status_w), seg(runtime_w));
+    let bot = format!("╰{}┴{}┴{}╯", seg(name_w), seg(status_w), seg(runtime_w));
+    let v = "│".bright_black();
+
+    let colorize_status = |s: &str| -> colored::ColoredString {
+        if s == "exit 0" {
+            s.green()
+        } else if s == "interrupted" {
+            s.yellow()
+        } else if s == "running" {
+            s.cyan()
+        } else {
+            s.red()
+        }
+    };
+
+    eprintln!();
+    eprintln!("  {}", "Session terminated".bold());
+    eprintln!();
+    eprintln!("  {}", top.bright_black());
+    eprintln!(
+        "  {v} {:<name_w$} {v} {:<status_w$} {v} {:<runtime_w$} {v}",
+        H_NAME.bold(),
+        H_STATUS.bold(),
+        H_RUNTIME.bold(),
+    );
+    eprintln!("  {}", mid.bright_black());
+
+    for row in &rows {
+        let name_cell = format!("{:<name_w$}", row.name).color(row.color);
+        let status_cell = colorize_status(&format!("{:<status_w$}", row.status));
+        let runtime_cell = format!("{:<runtime_w$}", row.runtime).dimmed();
+        eprintln!("  {v} {name_cell} {v} {status_cell} {v} {runtime_cell} {v}");
+    }
+
+    eprintln!("  {}", bot.bright_black());
 
     // Ensure output is flushed
     use std::io::Write;
