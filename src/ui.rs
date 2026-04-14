@@ -297,13 +297,14 @@ pub async fn run_terminal_ui(
             // Write to log file if available
             if let Some(log_file) = &log_file {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                let clean = crate::output::strip_ansi_escapes(&entry.content);
                 let log_line = if entry.is_error {
                     format!(
-                        "[{timestamp}] [STDERR] [{}] {}\n",
-                        entry.process, entry.content
+                        "[{timestamp}] [STDERR] [{}] {clean}\n",
+                        entry.process
                     )
                 } else {
-                    format!("[{timestamp}] [{}] {}\n", entry.process, entry.content)
+                    format!("[{timestamp}] [{}] {clean}\n", entry.process)
                 };
 
                 let mut file = log_file.lock().await;
