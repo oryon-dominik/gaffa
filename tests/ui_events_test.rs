@@ -288,11 +288,11 @@ mod integration_scenario_tests {
         assert_eq!(input, "restart scheduler");
 
         // User navigates up in history
-        if let Some(idx) = history_index {
-            if idx > 0 {
-                history_index = Some(idx - 1);
-                input = history[history_index.unwrap()].clone();
-            }
+        if let Some(idx) = history_index
+            && idx > 0
+        {
+            history_index = Some(idx - 1);
+            input = history[history_index.unwrap()].clone();
         }
         assert_eq!(input, "stop worker");
 

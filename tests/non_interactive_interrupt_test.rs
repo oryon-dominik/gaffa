@@ -18,7 +18,7 @@ test2: powershell -Command "while ($true) { Write-Host 'Process 2'; Start-Sleep 
 
     // Build the binary
     let output = Command::new("cargo")
-        .args(&["build", "--release"])
+        .args(["build", "--release"])
         .output()
         .expect("Failed to build");
 
@@ -26,7 +26,7 @@ test2: powershell -Command "while ($true) { Write-Host 'Process 2'; Start-Sleep 
 
     // Run gaffa in non-interactive mode
     let mut child = Command::new("target/release/gaffa")
-        .args(&["run", "--procfile", procfile_path.to_str().unwrap()])
+        .args(["run", "--procfile", procfile_path.to_str().unwrap()])
         .spawn()
         .expect("Failed to start gaffa");
 
@@ -56,6 +56,7 @@ test2: powershell -Command "while ($true) { Write-Host 'Process 2'; Start-Sleep 
 }
 
 #[test]
+#[allow(clippy::const_is_empty)]
 fn test_termination_summary_format() {
     // This test verifies the termination summary is properly formatted
     // We can't easily test the actual Ctrl+C behavior in automated tests
@@ -70,8 +71,8 @@ fn test_termination_summary_format() {
     let expected_columns = "process";
 
     // These strings should appear in the termination summary
-    assert!(expected_header.len() > 0);
-    assert!(expected_columns.len() > 0);
+    assert!(!expected_header.is_empty());
+    assert!(!expected_columns.is_empty());
 }
 
 #[test]
@@ -96,7 +97,7 @@ test2: echo "Test 2 done"
 
     // Run gaffa
     let output = Command::new("cargo")
-        .args(&[
+        .args([
             "run",
             "--",
             "run",
