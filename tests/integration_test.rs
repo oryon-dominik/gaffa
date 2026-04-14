@@ -108,15 +108,35 @@ fn test_gaffa_log_file() {
 
     handle.join().expect("Thread panicked");
 
-    // Check if log file was created
-    assert!(std::path::Path::new("test_output.log").exists());
+    // gaffa rotates `test_output.log` to `test_output-YYYY-MM-DD_NNN.log`,
+    // so find the most recent rotated file produced by this session.
+    let rotated: Vec<std::path::PathBuf> = std::fs::read_dir(".")
+        .expect("Failed to read current directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("test_output-") && n.ends_with(".log"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !rotated.is_empty(),
+        "No rotated test_output-*.log file was created"
+    );
 
-    // Read and verify log content
-    let log_content = std::fs::read_to_string("test_output.log").expect("Failed to read log file");
+    let log_path = rotated
+        .iter()
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .expect("Failed to pick newest rotated log");
+    let log_content = std::fs::read_to_string(log_path).expect("Failed to read log file");
     assert!(log_content.contains("logger"));
 
     // Cleanup
     let _ = std::fs::remove_file("test_log.procfile");
+    for p in &rotated {
+        let _ = std::fs::remove_file(p);
+    }
     let _ = std::fs::remove_file("test_output.log");
 }
 

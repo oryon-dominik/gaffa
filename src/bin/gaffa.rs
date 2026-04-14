@@ -101,9 +101,135 @@ fn show_help() {
     println!("  gaffa run --env PORT=8000    # Set environment variable");
 }
 
+/// Rotate a log file path for a new session: `path/to/gaffa.log` becomes
+/// `path/to/gaffa-YYYY-MM-DD_NNN.log` where NNN is the next unused 3-digit
+/// sequence for that date. Previous sessions stay on disk as backups so
+/// you can diff one run against another.
+fn rotate_log_path(path: &str) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+
+    let orig = Path::new(path);
+    let dir: PathBuf = orig
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = orig
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gaffa");
+    let ext = orig.extension().and_then(|s| s.to_str());
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    for n in 1..=999u32 {
+        let name = match ext {
+            Some(e) => format!("{stem}-{date}_{n:03}.{e}"),
+            None => format!("{stem}-{date}_{n:03}"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Pathological case: 999 sessions on the same day already on disk.
+    // Overwrite the last slot rather than failing outright.
+    let name = match ext {
+        Some(e) => format!("{stem}-{date}_999.{e}"),
+        None => format!("{stem}-{date}_999"),
+    };
+    dir.join(name)
+}
+
+/// Render the boxed startup banner. Falls back to a compact prefixed
+/// announcement when the terminal is too narrow or stdout is not a TTY,
+/// so piped output stays greppable.
+fn print_startup_banner(
+    procfile_path: &str,
+    process_names: &[String],
+    log_path: Option<&std::path::Path>,
+) {
+    use colored::Colorize;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let title = format!("gaffa {version}");
+    let procs_joined = process_names.join(", ");
+    let procs_value = format!("{} · {procs_joined}", process_names.len());
+
+    let mut rows: Vec<(&str, String)> = vec![
+        ("procfile", procfile_path.to_string()),
+        ("processes", procs_value.clone()),
+    ];
+    if let Some(p) = log_path {
+        rows.push(("logfile", p.display().to_string()));
+    }
+    rows.push(("controls", "q or Ctrl+C to stop".to_string()));
+
+    let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    let value_w = rows
+        .iter()
+        .map(|(_, v)| v.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count());
+    let inner_w = label_w + 2 + value_w;
+
+    let term_w = crossterm::terminal::size()
+        .ok()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(120);
+
+    // Need the box plus two leading spaces and the two │ edges — 6 cols.
+    if inner_w + 6 > term_w {
+        // Compact fallback: plain prefixed lines, always copy-safe.
+        println!(
+            "{}",
+            output::format_gaffa_message(
+                &format!("{title} · {procs_value}"),
+                5
+            )
+        );
+        if let Some(p) = log_path {
+            println!(
+                "{}",
+                output::format_gaffa_message(
+                    &format!("logging to {}", p.display()),
+                    5
+                )
+            );
+        }
+        println!(
+            "{}",
+            output::format_gaffa_message("q or Ctrl+C to stop", 5)
+        );
+        return;
+    }
+
+    let seg = "─".repeat(inner_w + 2);
+    let top = format!("╭{seg}╮");
+    let mid = format!("├{seg}┤");
+    let bot = format!("╰{seg}╯");
+    let v = "│".bright_black();
+
+    println!();
+    println!("  {}", top.bright_black());
+    let title_padded = format!("{title:<inner_w$}");
+    println!("  {v} {} {v}", title_padded.magenta().bold());
+    println!("  {}", mid.bright_black());
+    for (label, value) in &rows {
+        let label_cell = format!("{label:<label_w$}").bright_black();
+        let value_cell = format!("{value:<value_w$}");
+        println!("  {v} {label_cell}  {value_cell} {v}");
+    }
+    println!("  {}", bot.bright_black());
+    println!();
+}
+
 async fn run_non_interactive(
     manager: Arc<ProcessManager>,
     processes_to_run: Option<Vec<String>>,
+    procfile_path: &str,
+    log_path: Option<&std::path::Path>,
 ) -> Result<bool> {
     // Returns true if interrupted
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,13 +240,6 @@ async fn run_non_interactive(
     // Get max name length for proper alignment
     let max_name_len = manager.get_max_name_length().await;
 
-    // Show startup messages like legacy version
-    let process_count = if let Some(ref names) = processes_to_run {
-        names.len()
-    } else {
-        manager.process_names().await.len()
-    };
-
     // Collect the set of processes we're about to start so we can announce
     // them in a single compact banner instead of N identical "Starting" lines.
     let startup_names: Vec<String> = match &processes_to_run {
@@ -128,21 +247,7 @@ async fn run_non_interactive(
         None => manager.process_names().await,
     };
 
-    println!(
-        "{}",
-        output::format_gaffa_message(
-            &format!(
-                "Starting {} processes: {}",
-                process_count,
-                startup_names.join(", ")
-            ),
-            max_name_len
-        )
-    );
-    println!(
-        "{}",
-        output::format_gaffa_message("Press 'q' or Ctrl+C to stop", max_name_len)
-    );
+    print_startup_banner(procfile_path, &startup_names, log_path);
 
     // Spawn signal handler
     tokio::spawn({
@@ -538,19 +643,25 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
         manager.set_environment_variables(env_vars).await;
     }
 
-    // Set up log file if specified
-    if let Some(path) = log_file_path {
+    // Set up log file if specified. Each session gets its own rotated
+    // file — `gaffa.log` → `gaffa-YYYY-MM-DD_NNN.log` — so prior sessions
+    // stay on disk as backups next to the current one.
+    let rotated_log_path: Option<std::path::PathBuf> = if let Some(path) = log_file_path {
         ensure_log_parent_dir(path)?;
+        let rotated = rotate_log_path(path);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&rotated)
             .map_err(|e| ProcessError::ProcfileRead {
-                path: path.clone(),
+                path: rotated.display().to_string(),
                 source: e,
             })?;
         manager.set_log_file(Arc::new(Mutex::new(file))).await;
-    }
+        Some(rotated)
+    } else {
+        None
+    };
 
     manager.load_procfile(procfile_path).await?;
 
@@ -591,7 +702,14 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
             }
         }
     } else {
-        match run_non_interactive(manager.clone(), processes_to_run).await {
+        match run_non_interactive(
+            manager.clone(),
+            processes_to_run,
+            procfile_path,
+            rotated_log_path.as_deref(),
+        )
+        .await
+        {
             Ok(_) => {
                 reset_terminal_simple();
             }

@@ -10,6 +10,89 @@ use unicode_width::UnicodeWidthChar;
 use crate::constants::PROCESS_COLORS;
 use crate::ui::AppState;
 
+/// Sanitize a raw child-process line so it is safe to render inside
+/// gaffa's prefix column. Colour (SGR) sequences are preserved verbatim;
+/// everything that could reposition the cursor or repaint existing rows
+/// is dropped:
+///
+/// - Non-SGR CSI sequences (cursor moves, erase-in-line, scroll, etc.)
+/// - OSC sequences (window-title updates, hyperlinks, etc.)
+/// - Bare carriage returns — collapsed by keeping only the text after the
+///   final `\r`. This matches the visual effect a user would see if the
+///   child owned the terminal directly: a repainted status line settles
+///   on its most recent state.
+/// - Other C0 control bytes below 0x20 apart from TAB.
+///
+/// Without this pass, tools like Vite that redraw a "press h + enter to
+/// show help" hint via `\r\x1b[K` bleed their cursor motion into gaffa's
+/// output stream, where it can land on top of another process's prefix.
+fn sanitize_child_line(input: &str) -> String {
+    let logical = match input.rfind('\r') {
+        Some(idx) => &input[idx + 1..],
+        None => input,
+    };
+
+    let mut out = String::with_capacity(logical.len());
+    let bytes = logical.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    let start = i;
+                    i += 2;
+                    while i < bytes.len() && (0x30..=0x3f).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    while i < bytes.len() && (0x20..=0x2f).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
+                        let final_byte = bytes[i];
+                        i += 1;
+                        if final_byte == b'm' {
+                            out.push_str(&logical[start..i]);
+                        }
+                    }
+                    continue;
+                }
+                b']' => {
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
+        let b = bytes[i];
+        if b < 0x20 && b != b'\t' {
+            i += 1;
+            continue;
+        }
+
+        let ch_end = next_char_boundary(bytes, i);
+        out.push_str(&logical[i..ch_end]);
+        i = ch_end;
+    }
+
+    out
+}
+
 /// Wrap a raw line so each chunk fits within `content_w` display columns
 /// while preserving ANSI CSI/OSC escape sequences verbatim (they contribute
 /// 0 width). Each chunk except the last gets a trailing SGR reset so any
@@ -108,6 +191,9 @@ fn print_prefixed_wrapped(
     sep_color: Color,
     line: &str,
 ) {
+    let sanitized = sanitize_child_line(line);
+    let line = sanitized.as_str();
+
     let padding_len = max_name_len.saturating_sub(name.len());
     let padding = " ".repeat(padding_len);
     let colored_name = name.color(process_color);
@@ -441,5 +527,48 @@ mod tests {
     fn wrap_zero_width_returns_unmodified() {
         let chunks = wrap_ansi_preserving("anything", 0);
         assert_eq!(chunks, vec!["anything".to_string()]);
+    }
+
+    use super::sanitize_child_line;
+
+    #[test]
+    fn sanitize_keeps_sgr_colors() {
+        let input = "\x1b[32mgreen\x1b[0m plain";
+        assert_eq!(sanitize_child_line(input), "\x1b[32mgreen\x1b[0m plain");
+    }
+
+    #[test]
+    fn sanitize_strips_erase_in_line() {
+        let input = "before\x1b[Kafter";
+        assert_eq!(sanitize_child_line(input), "beforeafter");
+    }
+
+    #[test]
+    fn sanitize_strips_cursor_up() {
+        let input = "one\x1b[1Atwo";
+        assert_eq!(sanitize_child_line(input), "onetwo");
+    }
+
+    #[test]
+    fn sanitize_collapses_cr_repaint() {
+        // Vite-style status repaint: each \r resets the logical line,
+        // final state is whatever follows the last CR.
+        let input = "old hint\r\x1b[K  ➜  press h + enter to show help";
+        assert_eq!(
+            sanitize_child_line(input),
+            "  ➜  press h + enter to show help"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_osc_hyperlink() {
+        let input = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07 tail";
+        assert_eq!(sanitize_child_line(input), "link tail");
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode_and_tabs() {
+        let input = "col1\tcol2 ➜ ok";
+        assert_eq!(sanitize_child_line(input), "col1\tcol2 ➜ ok");
     }
 }
