@@ -1,1 +1,2 @@
-stubborn: powershell -Command "trap { Write-Host 'Ignoring signal'; continue } while ($true) { Start-Sleep -Seconds 1; Write-Host 'Stubborn process...' }"
+# Manual-testing fixture — native PowerShell lines (gaffa's default Windows shell).
+stubborn: trap { Write-Host 'Ignoring signal'; continue } while ($true) { Start-Sleep -Seconds 1; Write-Host 'Stubborn process...' }

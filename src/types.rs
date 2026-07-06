@@ -27,12 +27,6 @@ pub enum ProcessError {
     #[error("Process '{name}' is not running")]
     ProcessNotRunning { name: String },
 
-    #[error("Failed to parse command '{command}': {source}")]
-    CommandParse {
-        command: String,
-        source: shell_words::ParseError,
-    },
-
     #[error("Empty command for process '{name}'")]
     EmptyCommand { name: String },
 

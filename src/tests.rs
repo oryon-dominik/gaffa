@@ -123,8 +123,9 @@ mod test {
         assert!(GRACEFUL_SHUTDOWN_TIMEOUT >= Duration::from_secs(1));
         assert!(GRACEFUL_SHUTDOWN_TIMEOUT <= Duration::from_secs(30));
 
-        assert!(PROCESS_KILL_TIMEOUT >= Duration::from_millis(500));
-        assert!(PROCESS_KILL_TIMEOUT <= Duration::from_secs(10));
+        // Graceful window + post-kill confirmation must fit inside the outer
+        // shutdown timeout used by stop_all.
+        assert!(SIGTERM_WAIT_TIMEOUT + PROCESS_WAIT_TIMEOUT < GRACEFUL_SHUTDOWN_TIMEOUT);
 
         // Verify exit codes
         assert_eq!(EXIT_CODE_KEYBOARD_INTERRUPT, 512);

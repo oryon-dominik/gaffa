@@ -90,6 +90,8 @@ fn show_help() {
     println!("      --env-file <FILE>     Read environment variables from file");
     println!("      --shutdown-timeout <SECONDS>");
     println!("                            Grace period before force-kill (default: 10)");
+    println!("      --shell <PROGRAM>     Shell used to run commands (default: pwsh or cmd on");
+    println!("                            Windows, sh on Unix; env override: GAFFA_SHELL)");
     println!();
     println!("Arguments:");
     println!("  [PROCESS_NAMES]...       Specific processes to run (runs all if omitted)");
@@ -669,6 +671,10 @@ async fn handle_run_command(run_matches: &clap::ArgMatches) -> Result<()> {
             .await;
     }
 
+    // Resolve the shell: --shell > GAFFA_SHELL > platform default
+    let shell = gaffa::Shell::resolve(run_matches.get_one::<String>("shell").map(String::as_str));
+    manager.set_shell(shell).await;
+
     // Set environment variables
     if !env_vars.is_empty() {
         manager.set_environment_variables(env_vars).await;
@@ -826,6 +832,13 @@ async fn main() {
                         .help("Grace period (seconds) for each process to exit before force-kill (default: 10)")
                         .default_value("10")
                         .value_parser(clap::value_parser!(u64).range(1..=3600)),
+                )
+                .arg(
+                    Arg::new("shell")
+                        .long("shell")
+                        .value_name("PROGRAM")
+                        .help("Shell used to run commands (default: pwsh, fallback cmd, on Windows; sh on Unix; env override: GAFFA_SHELL)")
+                        .action(clap::ArgAction::Set),
                 ),
         );
 

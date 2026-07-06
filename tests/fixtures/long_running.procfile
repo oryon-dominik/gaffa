@@ -1,2 +1,3 @@
-server: powershell -Command "while ($true) { Start-Sleep -Seconds 1; Write-Host 'Server running...' }"
-worker: powershell -Command "while ($true) { Start-Sleep -Seconds 2; Write-Host 'Worker processing...' }"
+# Manual-testing fixture — native PowerShell lines (gaffa's default Windows shell).
+server: while ($true) { Start-Sleep -Seconds 1; Write-Host 'Server running...' }
+worker: while ($true) { Start-Sleep -Seconds 2; Write-Host 'Worker processing...' }

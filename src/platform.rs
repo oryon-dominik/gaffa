@@ -3,6 +3,7 @@ use tokio::process::Child;
 #[cfg(target_os = "windows")]
 pub mod windows {
     use super::*;
+    use crate::constants::{PROCESS_WAIT_TIMEOUT, TERMINATION_POLL_INTERVAL};
     use std::sync::OnceLock;
     use std::time::Duration;
     use winapi::shared::minwindef::{DWORD, FALSE};
@@ -104,56 +105,63 @@ pub mod windows {
         cmd.creation_flags(crate::constants::CREATE_NEW_PROCESS_GROUP);
     }
 
-    pub async fn terminate_process(child: &mut Child, timeout: Duration) -> Option<i32> {
+    /// Terminate gracefully (Ctrl+Break), escalating to a force kill.
+    /// Waits up to `timeout` for the graceful signal to take effect before
+    /// escalating. Returns the exit status, or `None` if the process is still
+    /// running.
+    pub async fn terminate_process(
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+
         if let Some(pid) = child.id() {
-            // Children are spawned with CREATE_NEW_PROCESS_GROUP, so `pid`
-            // doubles as the process group id. `GenerateConsoleCtrlEvent` can
-            // only deliver CTRL_BREAK_EVENT to a targeted group — CTRL_C_EVENT
-            // is restricted to group 0 (the caller's own group). Python,
-            // Node.js and most console runtimes handle Ctrl+Break as a
-            // graceful-shutdown signal, which is what we want here.
-            unsafe {
+            // Graceful: Ctrl+Break to the child's process group (the child is
+            // its own group leader thanks to CREATE_NEW_PROCESS_GROUP).
+            // Console apps actually receive this — taskkill without /F only
+            // posts WM_CLOSE, which windowless console processes never see.
+            let signal_sent = unsafe {
                 use winapi::um::wincon::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
-                let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-            }
+                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0
+            };
 
-            // Poll at a short interval so responsive children return quickly.
-            let check_interval = Duration::from_millis(100);
-            let max_checks =
-                ((timeout.as_millis() / check_interval.as_millis()) as usize).max(1);
-
-            for _ in 0..max_checks {
-                if let Ok(Some(status)) = child.try_wait() {
-                    return status.code();
+            if signal_sent {
+                // Poll for exit — returns as soon as the process is gone,
+                // within the caller-supplied graceful window.
+                let mut waited = Duration::ZERO;
+                while waited < timeout {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return Some(status);
+                    }
+                    tokio::time::sleep(TERMINATION_POLL_INTERVAL).await;
+                    waited += TERMINATION_POLL_INTERVAL;
                 }
-                tokio::time::sleep(check_interval).await;
             }
+            // No console to deliver the signal (services, CI) — skip straight
+            // to the force kill instead of waiting for a signal never sent.
 
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
-
-            // Stubborn child — force kill as last resort.
+            // Escalate: force kill the whole process tree.
             force_kill_process(child).await;
+        }
 
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
-
-            None
-        } else {
-            None
+        // Confirm the exit — taskkill returns before the process is gone.
+        match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            _ => None,
         }
     }
 
-    pub async fn force_kill_process(child: &mut Child) -> Option<i32> {
+    /// Force kill the whole process tree. Fire-and-forget: taskkill returns
+    /// before the process exits — callers confirm via `child.wait()`.
+    pub async fn force_kill_process(child: &mut Child) {
         if let Some(pid) = child.id() {
-            // Force kill with /F and /T flags
-            let _ = std::process::Command::new("taskkill")
+            let _ = tokio::process::Command::new("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
+                .output()
+                .await;
         }
-        None
     }
 
     /// Ensure the console output mode has the flags required for correct ANSI
@@ -180,8 +188,9 @@ pub mod windows {
         const ENABLE_PROCESSED_OUTPUT: DWORD = 0x0001;
         const ENABLE_WRAP_AT_EOL_OUTPUT: DWORD = 0x0002;
         const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
-        const REQUIRED_FLAGS: DWORD =
-            ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        const REQUIRED_FLAGS: DWORD = ENABLE_PROCESSED_OUTPUT
+            | ENABLE_WRAP_AT_EOL_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
 
         unsafe {
             for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
@@ -203,7 +212,7 @@ pub mod windows {
 #[cfg(not(target_os = "windows"))]
 pub mod unix {
     use super::*;
-    use crate::constants::{PROCESS_KILL_TIMEOUT, SIGTERM_WAIT_TIMEOUT};
+    use crate::constants::{PROCESS_WAIT_TIMEOUT, TERMINATION_POLL_INTERVAL};
     use std::time::Duration;
 
     pub fn configure_command(cmd: &mut tokio::process::Command) {
@@ -215,50 +224,60 @@ pub mod unix {
     /// No-op on Unix — process groups handle cleanup.
     pub fn assign_child_to_job(_child: &Child) {}
 
-    pub async fn terminate_process(child: &mut Child, timeout: Duration) -> Option<i32> {
-        if let Some(pid) = child.id() {
-            unsafe {
-                // Send SIGTERM to the process
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-
-            // Give time for graceful shutdown
-            tokio::time::sleep(SIGTERM_WAIT_TIMEOUT).await;
-
-            // Check if process exited
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
-
-            // Try SIGTERM to process group
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
-
-            // Wait again
-            tokio::time::sleep(PROCESS_KILL_TIMEOUT).await;
-
-            // Check again
-            if let Ok(Some(status)) = child.try_wait() {
-                return status.code();
-            }
+    /// Terminate gracefully (SIGTERM), escalating to SIGKILL.
+    /// Waits up to `timeout` for the process to exit before escalating.
+    /// Returns the exit status, or `None` if the process is still running.
+    pub async fn terminate_process(
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
         }
 
-        // Final wait, capped at the caller-supplied timeout.
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => status.code(),
+        if let Some(pid) = child.id() {
+            // Graceful: SIGTERM to the whole process group (the child is its
+            // own group leader thanks to process_group(0)). Fall back to the
+            // pid alone if the group kill fails.
+            let signal_sent = unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM) == 0
+                    || libc::kill(pid as i32, libc::SIGTERM) == 0
+            };
+
+            if signal_sent {
+                // Poll for exit — returns as soon as the process is gone,
+                // within the caller-supplied graceful window.
+                let mut waited = Duration::ZERO;
+                while waited < timeout {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return Some(status);
+                    }
+                    tokio::time::sleep(TERMINATION_POLL_INTERVAL).await;
+                    waited += TERMINATION_POLL_INTERVAL;
+                }
+            }
+
+            // Escalate: SIGKILL to the whole process group.
+            force_kill_process(child).await;
+        }
+
+        // Confirm the exit (also reaps the child).
+        match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => Some(status),
             _ => None,
         }
     }
 
-    pub async fn force_kill_process(child: &mut Child) -> Option<i32> {
+    /// Force kill the whole process tree. Fire-and-forget: callers confirm
+    /// the exit via `child.wait()`.
+    pub async fn force_kill_process(child: &mut Child) {
         if let Some(pid) = child.id() {
             unsafe {
-                // Send SIGKILL to the process group
-                libc::kill(-(pid as i32), libc::SIGKILL);
+                if libc::kill(-(pid as i32), libc::SIGKILL) != 0 {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
             }
         }
-        None
     }
 
     /// No-op on Unix — ANSI escape codes are natively supported.

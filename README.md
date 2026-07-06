@@ -63,9 +63,28 @@ gaffa run --env PORT=8000 --env PYTHONUNBUFFERED=1
 # Load environment from file
 gaffa run --env-file .env
 
+# Choose the shell that runs the Procfile command lines
+gaffa run --shell bash
+
 # Full command example
 gaffa run devserver tailwind --procfile procfile --log-file logs/gaffa.log --env PYTHONUNBUFFERED=1 --interactive
 ```
+
+## Shell
+
+Each Procfile command line is passed verbatim to a shell — pipes, `&&`,
+redirects, and PATH lookups (including `.cmd` shims like `npm` on Windows)
+work exactly as they would when typed into that shell.
+
+Default: `pwsh` (fallback `cmd` if PowerShell 7 is not installed) on Windows,
+`sh` on Unix. Override with `--shell <PROGRAM>` or the `GAFFA_SHELL`
+environment variable; `--shell` wins. Known shells (`cmd`, `pwsh`,
+`powershell`) get their native command flag, everything else is invoked
+POSIX-style with `-c`.
+
+Note for Windows: with the `pwsh` default, command lines are PowerShell code —
+`$VAR` inside double quotes is expanded by PowerShell. Use single quotes for
+literal strings, or `--shell cmd` for cmd-style lines.
 
 ## Output Buffering
 

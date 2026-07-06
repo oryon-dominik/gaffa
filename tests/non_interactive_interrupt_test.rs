@@ -5,10 +5,11 @@ use std::time::Duration;
 #[test]
 #[ignore] // This test requires manual verification since we can't easily send Ctrl+C in tests
 fn test_non_interactive_ctrl_c_shows_summary() {
-    // Create a test Procfile
+    // Create a test Procfile — native PowerShell lines, run with an explicit
+    // `--shell powershell` so the test does not depend on pwsh being installed.
     let procfile_content = r#"
-test1: powershell -Command "while ($true) { Write-Host 'Process 1'; Start-Sleep -Seconds 1 }"
-test2: powershell -Command "while ($true) { Write-Host 'Process 2'; Start-Sleep -Seconds 1 }"
+test1: while ($true) { Write-Host 'Process 1'; Start-Sleep -Seconds 1 }
+test2: while ($true) { Write-Host 'Process 2'; Start-Sleep -Seconds 1 }
 "#;
 
     let test_dir = std::env::temp_dir().join("gaffa_test_ctrl_c");
@@ -26,7 +27,13 @@ test2: powershell -Command "while ($true) { Write-Host 'Process 2'; Start-Sleep 
 
     // Run gaffa in non-interactive mode
     let mut child = Command::new("target/release/gaffa")
-        .args(["run", "--procfile", procfile_path.to_str().unwrap()])
+        .args([
+            "run",
+            "--shell",
+            "powershell",
+            "--procfile",
+            procfile_path.to_str().unwrap(),
+        ])
         .spawn()
         .expect("Failed to start gaffa");
 

@@ -68,13 +68,13 @@ fn short_sleep_command() -> &'static str {
 }
 
 /// Command that produces many output lines quickly (platform-specific).
+/// The Windows variant is native PowerShell — pin the manager's shell to
+/// `powershell` (always present) when using it.
 fn fast_output_command(lines: u32) -> String {
     if cfg!(windows) {
-        format!(
-            r#"powershell -NoProfile -Command "1..{lines} | ForEach-Object {{ Write-Host \"line $_\" }}""#
-        )
+        format!("1..{lines} | ForEach-Object {{ 'line ' + $_ }}")
     } else {
-        format!(r#"sh -c 'i=1; while [ $i -le {lines} ]; do echo "line $i"; i=$((i+1)); done'"#)
+        format!(r#"i=1; while [ $i -le {lines} ]; do echo "line $i"; i=$((i+1)); done"#)
     }
 }
 
@@ -606,6 +606,11 @@ async fn test_fast_output_process_doesnt_block() {
     // Start a process that produces many output lines quickly and verify
     // gaffa doesn't deadlock or lose the process handle.
     let manager = Arc::new(ProcessManager::new());
+    if cfg!(windows) {
+        manager
+            .set_shell(gaffa::Shell::from_program("powershell"))
+            .await;
+    }
     let content = format!("fast: {}", fast_output_command(500));
     let path = create_procfile(&content);
 

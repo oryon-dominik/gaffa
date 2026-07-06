@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use colored::Colorize;
 use tokio::{
     process::{Child, Command as TokioCommand},
-    sync::Mutex,
+    sync::{Mutex, mpsc, oneshot},
     time::sleep,
 };
 
@@ -16,6 +16,7 @@ use crate::platform::{
     assign_child_to_job, configure_command, force_kill_process, terminate_process,
 };
 use crate::procfile;
+use crate::shell::Shell;
 use crate::types::*;
 use crate::ui::AppState;
 use crate::ui_wrapper::run_interactive_ui;
@@ -69,13 +70,29 @@ pub(crate) struct ProcessConfig {
     pub env_vars: HashMap<String, String>,
     pub log_file: Option<Arc<Mutex<std::fs::File>>>,
     pub shutdown_timeout: Duration,
+    pub shell: Shell,
+}
+
+/// Commands accepted by a process actor.
+enum ActorCommand {
+    /// Graceful terminate (Ctrl+Break/SIGTERM → force kill). Replies with the
+    /// exit code, or `None` if the process survived.
+    Stop(oneshot::Sender<Option<i32>>),
+    /// Immediate force kill. Replies with the exit code, or `None` if the
+    /// process survived even that.
+    Kill(oneshot::Sender<Option<i32>>),
+}
+
+/// Handle to the actor task that owns a running child process.
+pub(crate) struct ActorHandle {
+    commands: mpsc::Sender<ActorCommand>,
+    pid: Option<u32>,
 }
 
 /// Mutable runtime state for all managed processes.
 pub(crate) struct RuntimeState {
     pub processes: HashMap<String, ProcessInfo>,
-    pub children: HashMap<String, Child>,
-    pub monitor_handles: HashMap<String, tokio::task::JoinHandle<()>>,
+    pub actors: HashMap<String, ActorHandle>,
     pub output_handles: HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -106,11 +123,11 @@ impl ProcessManager {
                 env_vars: HashMap::new(),
                 log_file: None,
                 shutdown_timeout: GRACEFUL_SHUTDOWN_TIMEOUT,
+                shell: Shell::platform_default().clone(),
             })),
             runtime: Arc::new(Mutex::new(RuntimeState {
                 processes: HashMap::new(),
-                children: HashMap::new(),
-                monitor_handles: HashMap::new(),
+                actors: HashMap::new(),
                 output_handles: HashMap::new(),
             })),
         }
@@ -135,6 +152,12 @@ impl ProcessManager {
     pub async fn set_environment_variables(&self, env_vars: HashMap<String, String>) {
         let mut config = self.config.lock().await;
         config.env_vars = env_vars;
+    }
+
+    /// Set the shell used to execute Procfile command lines.
+    pub async fn set_shell(&self, shell: Shell) {
+        let mut config = self.config.lock().await;
+        config.shell = shell;
     }
 
     /// Load process definitions from a Procfile.
@@ -177,10 +200,10 @@ impl ProcessManager {
     ///
     /// Returns an error if the process is already running, not found, or fails to start.
     pub async fn start_process_with_opts(&self, name: &str, opts: &LifecycleOptions) -> Result<()> {
-        // Check if process is actually running (exists in children map)
+        // Check if process is actually running (has a live actor)
         {
             let runtime = self.runtime.lock().await;
-            if runtime.children.contains_key(name) {
+            if runtime.actors.contains_key(name) {
                 return Err(ProcessError::ProcessAlreadyRunning {
                     name: name.to_string(),
                 });
@@ -238,9 +261,12 @@ impl ProcessManager {
 
     /// Spawn the actual process with proper I/O handling and optional UI state.
     ///
+    /// The command line is passed verbatim to the configured shell
+    /// (`pwsh`/`cmd` on Windows, `sh` on Unix) — gaffa does not parse it.
+    ///
     /// # Errors
     ///
-    /// Returns an error if command parsing fails, command is empty, or process spawn fails.
+    /// Returns an error if the command is empty or the process fails to spawn.
     ///
     /// # Panics
     ///
@@ -251,30 +277,41 @@ impl ProcessManager {
         command: &str,
         app_state: Option<Arc<AppState>>,
     ) -> Result<()> {
-        let command_parts =
-            shell_words::split(command).map_err(|e| ProcessError::CommandParse {
-                command: command.to_string(),
-                source: e,
-            })?;
-
-        if command_parts.is_empty() {
+        let command = command.trim();
+        if command.is_empty() {
             return Err(ProcessError::EmptyCommand {
                 name: name.to_string(),
             });
         }
 
-        let program = &command_parts[0];
-        let args = &command_parts[1..];
-
-        let mut cmd = TokioCommand::new(program);
-        cmd.args(args);
-
-        // Apply environment variables
-        {
+        let (shell, env_vars, log_file) = {
             let config = self.config.lock().await;
-            for (key, value) in config.env_vars.iter() {
-                cmd.env(key, value);
+            (
+                config.shell.clone(),
+                config.env_vars.clone(),
+                config.log_file.clone(),
+            )
+        };
+
+        let mut cmd = TokioCommand::new(&shell.program);
+
+        #[cfg(target_os = "windows")]
+        {
+            // raw_arg: cmd.exe does not follow argv quoting rules, and the
+            // shell should receive the Procfile line verbatim as script text
+            // — std's automatic quote-escaping would mangle both.
+            for arg in &shell.args {
+                cmd.raw_arg(arg);
             }
+            cmd.raw_arg(shell.prepare_command(command).as_ref());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            cmd.args(&shell.args).arg(command);
+        }
+
+        for (key, value) in env_vars {
+            cmd.env(key, value);
         }
 
         // Only inherit stdin in non-interactive mode
@@ -302,105 +339,35 @@ impl ProcessManager {
         let stdout = child.stdout.take().expect("stdout pipe");
         let stderr = child.stderr.take().expect("stderr pipe");
 
-        // Get log file from config
-        let log_file = {
-            let config = self.config.lock().await;
-            config.log_file.clone()
-        };
-
         self.spawn_output_handler_with_state(name, stdout, stderr, app_state.clone(), log_file)
             .await;
 
+        // Hand the child to its actor task — the actor owns it from here on.
+        let (commands, command_rx) = mpsc::channel(4);
         {
             let mut runtime = self.runtime.lock().await;
-            runtime.children.insert(name.to_string(), child);
+            runtime.actors.insert(
+                name.to_string(),
+                ActorHandle {
+                    commands,
+                    pid: child.id(),
+                },
+            );
         }
 
-        // Spawn a task to monitor the process exit
-        let name_str = name.to_string();
-        let runtime_arc = Arc::clone(&self.runtime);
-        let app_state_monitor = app_state;
+        let shutdown_timeout = {
+            let config = self.config.lock().await;
+            config.shutdown_timeout
+        };
 
-        let monitor_handle = tokio::spawn(async move {
-            // Give process time to start
-            tokio::time::sleep(SPAWN_WAIT_DELAY).await;
-
-            // Use exponential backoff for checking process status
-            let mut check_interval = INITIAL_CHECK_INTERVAL;
-
-            loop {
-                tokio::time::sleep(check_interval).await;
-
-                // Increase interval up to max for efficiency
-                if check_interval < MAX_CHECK_INTERVAL {
-                    check_interval = check_interval.saturating_mul(2).min(MAX_CHECK_INTERVAL);
-                }
-
-                let mut runtime = runtime_arc.lock().await;
-                if let Some(child) = runtime.children.get_mut(&name_str) {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        // Process has exited
-                        let exit_code = status.code();
-
-                        // Remove from children map
-                        runtime.children.remove(&name_str);
-
-                        // Update process info
-                        if let Some(info) = runtime.processes.get_mut(&name_str) {
-                            if let Some(start_time) = info.last_restart {
-                                let session_runtime = start_time.elapsed();
-                                info.cumulative_runtime += session_runtime;
-                            }
-                            info.status = ProcessStatus::Stopped;
-                            info.stopped_at = Some(Instant::now());
-                            info.exit_code = exit_code;
-                        }
-                        drop(runtime);
-
-                        // Log the exit
-                        if let Some(state) = &app_state_monitor {
-                            let exit_msg = match exit_code {
-                                Some(0) => format!("Process '{name_str}' exited cleanly"),
-                                Some(-1) => format!("Process '{name_str}' terminated gracefully"), // Force terminated
-                                Some(EXIT_CODE_KEYBOARD_INTERRUPT) => {
-                                    format!("Process '{name_str}' interrupted gracefully")
-                                } // KeyboardInterrupt
-                                Some(EXIT_CODE_CTRL_C_WINDOWS) => {
-                                    format!("Process '{name_str}' interrupted gracefully")
-                                } // CTRL_C_EVENT on Windows
-                                Some(code) => {
-                                    format!("Process '{name_str}' exited with code {code}")
-                                }
-                                None => format!("Process '{name_str}' terminated by signal"),
-                            };
-                            state.add_system_log(exit_msg).await;
-                        }
-
-                        // Clean up own handles
-                        {
-                            let mut rt = runtime_arc.lock().await;
-                            rt.monitor_handles.remove(&name_str);
-                            // Don't abort output handles - let them finish draining
-                            // Just remove the tracking entries
-                            rt.output_handles.remove(&name_str);
-                        }
-
-                        break;
-                    }
-                } else {
-                    // Process was removed from children map (stopped manually)
-                    break;
-                }
-            }
-        });
-
-        // Store the monitor handle so it can be aborted if needed
-        {
-            let mut runtime = self.runtime.lock().await;
-            runtime
-                .monitor_handles
-                .insert(name.to_string(), monitor_handle);
-        }
+        tokio::spawn(run_process_actor(
+            name.to_string(),
+            child,
+            command_rx,
+            Arc::clone(&self.runtime),
+            app_state,
+            shutdown_timeout,
+        ));
 
         Ok(())
     }
@@ -478,101 +445,76 @@ impl ProcessManager {
             }
         }
 
-        // Take the child out of the runtime
-        let maybe_child = {
-            let mut runtime = self.runtime.lock().await;
-            runtime.children.remove(name)
+        // Ask the actor that owns the child to terminate it. The actor
+        // updates the shared state before replying.
+        let exit_code = match self.send_actor_command(name, ActorCommand::Stop).await {
+            Some(reply) => reply,
+            None => {
+                return Err(ProcessError::ProcessNotRunning {
+                    name: name.to_string(),
+                });
+            }
         };
 
-        if let Some(mut child) = maybe_child {
-            let exit_code = self.terminate_child_process(&mut child).await;
-
-            // If process didn't terminate gracefully, it's still running
-            if exit_code.is_none() {
-                // Put it back in the children map since it's still running
-                let mut runtime = self.runtime.lock().await;
-                runtime.children.insert(name.to_string(), child);
-                drop(runtime);
-
-                if opts.log_messages {
-                    if let Some(state) = &opts.app_state {
-                        state
-                            .add_system_log(format!(
-                                "Process '{name}' is ignoring termination signals"
-                            ))
-                            .await;
-                    } else {
-                        self.print_system_message(&format!(
-                            "Process '{name}' is ignoring termination signals"
-                        ))
-                        .await;
-                    }
-                }
-
-                // Don't return error - the process is still running but stubborn
-                // This allows restart to work properly
-                return Ok(());
-            }
-
-            // Abort the monitor and output handles for this process
-            {
-                let mut runtime = self.runtime.lock().await;
-                if let Some(handle) = runtime.monitor_handles.remove(name) {
-                    handle.abort();
-                }
-                if let Some(handles) = runtime.output_handles.remove(name) {
-                    for handle in handles {
-                        handle.abort();
-                    }
-                }
-
-                if let Some(info) = runtime.processes.get_mut(name) {
-                    // Calculate and add the runtime for this session
-                    if let Some(start_time) = info.last_restart {
-                        let session_runtime = start_time.elapsed();
-                        info.cumulative_runtime += session_runtime;
-                    }
-                    info.status = ProcessStatus::Stopped;
-                    info.stopped_at = Some(Instant::now());
-                    info.exit_code = exit_code;
-                }
-            }
-
-            // Log to UI if available (if requested)
+        // A `None` exit code means the process survived even the force kill.
+        if exit_code.is_none() {
             if opts.log_messages {
                 if let Some(state) = &opts.app_state {
                     state
-                        .add_system_log(format!("Stopped process '{name}'"))
+                        .add_system_log(format!("Process '{name}' is ignoring termination signals"))
                         .await;
                 } else {
-                    self.print_system_message(&format!("Stopped process '{name}'"))
-                        .await;
+                    self.print_system_message(&format!(
+                        "Process '{name}' is ignoring termination signals"
+                    ))
+                    .await;
                 }
             }
 
-            Ok(())
-        } else {
-            Err(ProcessError::ProcessNotRunning {
-                name: name.to_string(),
-            })
+            // Don't return error - the process is still running but stubborn
+            // This allows restart to work properly
+            return Ok(());
         }
+
+        if opts.log_messages {
+            if let Some(state) = &opts.app_state {
+                state
+                    .add_system_log(format!("Stopped process '{name}'"))
+                    .await;
+            } else {
+                self.print_system_message(&format!("Stopped process '{name}'"))
+                    .await;
+            }
+        }
+
+        Ok(())
     }
 
-    /// Terminate a child process with platform-specific handling.
-    /// Returns the exit code if available.
-    async fn terminate_child_process(&self, child: &mut Child) -> Option<i32> {
-        // Try to get exit status first (in case process already exited)
-        if let Ok(Some(status)) = child.try_wait() {
-            return status.code();
+    /// Send a lifecycle command to a process actor and await its reply.
+    ///
+    /// Returns `None` when no actor exists (process not running) or the actor
+    /// finished before receiving the command. Otherwise returns the actor's
+    /// reply: `Some(code)` when the process exited, `None` when it survived
+    /// termination.
+    async fn send_actor_command(
+        &self,
+        name: &str,
+        command: fn(oneshot::Sender<Option<i32>>) -> ActorCommand,
+    ) -> Option<Option<i32>> {
+        let sender = {
+            let runtime = self.runtime.lock().await;
+            runtime.actors.get(name).map(|actor| actor.commands.clone())
+        }?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if sender.send(command(reply_tx)).await.is_err() {
+            // The actor finished (process exited) while we were asking.
+            return None;
         }
 
-        let timeout = {
-            let config = self.config.lock().await;
-            config.shutdown_timeout
-        };
-
-        // Use platform-specific termination
-        terminate_process(child, timeout).await
+        // The actor always replies; a dropped reply means it finalized a
+        // natural exit that raced our command — the process is stopped.
+        Some(reply_rx.await.unwrap_or(Some(EXIT_CODE_FORCED_TERMINATION)))
     }
 
     /// Restart a specific process by name.
@@ -616,37 +558,13 @@ impl ProcessManager {
         // Attempt graceful stop
         let _ = self.stop_process_with_opts(name, &quiet_opts).await;
 
-        // Check if child is actually gone (stop may return Ok for stubborn processes)
-        let still_running = {
-            let rt = self.runtime.lock().await;
-            rt.children.contains_key(name)
-        };
+        // Escalate if the actor is still alive (stubborn process). If even
+        // the force kill fails, start_process below reports AlreadyRunning
+        // instead of racing a second instance against the survivor.
+        let _ = self.send_actor_command(name, ActorCommand::Kill).await;
 
-        if still_running {
-            // Force kill for restart
-            let mut rt = self.runtime.lock().await;
-            if let Some(mut child) = rt.children.remove(name) {
-                drop(rt); // drop lock before async I/O
-                let _ = force_kill_process(&mut child).await;
-                // Re-acquire lock for cleanup
-                let mut rt = self.runtime.lock().await;
-                if let Some(handle) = rt.monitor_handles.remove(name) {
-                    handle.abort();
-                }
-                if let Some(handles) = rt.output_handles.remove(name) {
-                    for h in handles {
-                        h.abort();
-                    }
-                }
-                if let Some(info) = rt.processes.get_mut(name) {
-                    info.status = ProcessStatus::Stopped;
-                    info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
-                }
-            }
-            sleep(Duration::from_millis(500)).await;
-        } else {
-            sleep(Duration::from_millis(200)).await;
-        }
+        // Brief settle delay so released resources (ports, files) are free.
+        sleep(Duration::from_millis(200)).await;
 
         // Start the process quietly (we already announced the restart)
         self.start_process_with_opts(name, &quiet_opts).await
@@ -665,9 +583,9 @@ impl ProcessManager {
         let pids: Vec<(String, u32)> = {
             let runtime = self.runtime.lock().await;
             runtime
-                .children
+                .actors
                 .iter()
-                .filter_map(|(name, child)| child.id().map(|pid| (name.clone(), pid)))
+                .filter_map(|(name, actor)| actor.pid.map(|pid| (name.clone(), pid)))
                 .collect()
         };
 
@@ -677,17 +595,9 @@ impl ProcessManager {
                 self.print_system_message(&format!("Sending interrupt signal to '{name}'..."))
                     .await;
 
-                // On Windows, try multiple approaches
-                // First try Ctrl+C event
-                unsafe {
-                    use winapi::um::wincon::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
-                    let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid);
-                }
-
-                // Small delay
-                tokio::time::sleep(INITIAL_CHECK_INTERVAL).await;
-
-                // Try Ctrl+Break as alternative
+                // CTRL_C_EVENT cannot target a process group (documented
+                // no-op for nonzero group ids), so send CTRL_BREAK_EVENT —
+                // the child is its own group leader.
                 unsafe {
                     use winapi::um::wincon::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
                     let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
@@ -698,7 +608,9 @@ impl ProcessManager {
                 self.print_system_message(&format!("Sending SIGINT to '{name}'..."))
                     .await;
                 unsafe {
-                    libc::kill(pid as i32, libc::SIGINT);
+                    if libc::kill(-(pid as i32), libc::SIGINT) != 0 {
+                        libc::kill(pid as i32, libc::SIGINT);
+                    }
                 }
             }
         }
@@ -706,13 +618,13 @@ impl ProcessManager {
 
     /// Stop all running processes with explicit lifecycle options.
     pub async fn stop_all_with_opts(&self, opts: &LifecycleOptions) {
-        // Get all RUNNING processes, not just those with children
+        // Everything not already stopped — including processes mid-restart.
         let process_names: Vec<String> = {
             let runtime = self.runtime.lock().await;
             runtime
                 .processes
                 .iter()
-                .filter(|(_, info)| info.status == ProcessStatus::Running)
+                .filter(|(_, info)| info.status != ProcessStatus::Stopped)
                 .map(|(name, _)| name.clone())
                 .collect()
         };
@@ -778,36 +690,9 @@ impl ProcessManager {
             }
         }
 
-        // Force cleanup any processes that failed graceful shutdown
-        if !failed_shutdowns.is_empty() {
-            let remaining: Vec<(String, Child)> = {
-                let mut runtime = self.runtime.lock().await;
-                failed_shutdowns
-                    .into_iter()
-                    .filter_map(|name| runtime.children.remove(&name).map(|child| (name, child)))
-                    .collect()
-            };
-
-            #[allow(unused_mut)]
-            for (name, mut child) in remaining {
-                // Force kill without waiting
-                let _ = force_kill_process(&mut child).await;
-
-                // Clean up handles and update process status
-                let mut runtime = self.runtime.lock().await;
-                if let Some(handle) = runtime.monitor_handles.remove(&name) {
-                    handle.abort();
-                }
-                if let Some(handles) = runtime.output_handles.remove(&name) {
-                    for handle in handles {
-                        handle.abort();
-                    }
-                }
-                if let Some(info) = runtime.processes.get_mut(&name) {
-                    info.status = ProcessStatus::Stopped;
-                    info.exit_code = Some(EXIT_CODE_FORCED_TERMINATION);
-                }
-            }
+        // Force kill any processes that failed graceful shutdown
+        for name in failed_shutdowns {
+            let _ = self.send_actor_command(&name, ActorCommand::Kill).await;
         }
 
         // Small delay to ensure all processes have stopped
@@ -1061,9 +946,10 @@ impl ProcessManager {
         config.max_name_length.max(5) // Ensure at least 5 for "gaffa"
     }
 
-    /// Get the number of active monitor handles (for diagnostics/testing).
+    /// Get the number of live process actors (for diagnostics/testing).
+    /// Each running child is owned by exactly one actor task.
     pub async fn monitor_handle_count(&self) -> usize {
-        self.runtime.lock().await.monitor_handles.len()
+        self.runtime.lock().await.actors.len()
     }
 
     /// Get the number of active output handles (for diagnostics/testing).
@@ -1079,7 +965,7 @@ impl ProcessManager {
 
     /// Get the number of active child processes (for diagnostics/testing).
     pub async fn children_count(&self) -> usize {
-        self.runtime.lock().await.children.len()
+        self.runtime.lock().await.actors.len()
     }
 
     /// Get a color for a process (consistent assignment).
@@ -1148,7 +1034,7 @@ impl ProcessManager {
     /// Used during quit to ensure consistent state.
     pub async fn fix_orphaned_process_status(&self) {
         let mut runtime = self.runtime.lock().await;
-        let child_names: Vec<String> = runtime.children.keys().cloned().collect();
+        let child_names: Vec<String> = runtime.actors.keys().cloned().collect();
         for (name, info) in runtime.processes.iter_mut() {
             if info.status == ProcessStatus::Running && !child_names.contains(name) {
                 info.status = ProcessStatus::Stopped;
@@ -1190,6 +1076,107 @@ impl ProcessManager {
 impl Default for ProcessManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Own a child process: react to its exit and execute lifecycle commands.
+///
+/// Replaces the previous polling monitor — `child.wait()` resolves the moment
+/// the process exits, with no lock contention on the shared runtime state.
+/// State updates happen *before* command replies are sent, so callers observe
+/// consistent state as soon as their reply arrives.
+async fn run_process_actor(
+    name: String,
+    mut child: Child,
+    mut commands: mpsc::Receiver<ActorCommand>,
+    runtime: Arc<Mutex<RuntimeState>>,
+    app_state: Option<Arc<AppState>>,
+    shutdown_timeout: Duration,
+) {
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let exit_code = status.ok().and_then(|s| s.code());
+                finalize_process_exit(&name, exit_code, &runtime).await;
+                announce_natural_exit(&name, exit_code, app_state.as_ref()).await;
+                return;
+            }
+            command = commands.recv() => match command {
+                Some(ActorCommand::Stop(reply)) => {
+                    if let Some(status) = terminate_process(&mut child, shutdown_timeout).await {
+                        let code = status.code().unwrap_or(EXIT_CODE_FORCED_TERMINATION);
+                        finalize_process_exit(&name, Some(code), &runtime).await;
+                        let _ = reply.send(Some(code));
+                        return;
+                    }
+                    // Stubborn — stay alive and keep watching.
+                    let _ = reply.send(None);
+                }
+                Some(ActorCommand::Kill(reply)) => {
+                    force_kill_process(&mut child).await;
+                    match tokio::time::timeout(PROCESS_WAIT_TIMEOUT, child.wait()).await {
+                        Ok(Ok(status)) => {
+                            let code = status.code().unwrap_or(EXIT_CODE_FORCED_TERMINATION);
+                            finalize_process_exit(&name, Some(code), &runtime).await;
+                            let _ = reply.send(Some(code));
+                            return;
+                        }
+                        _ => {
+                            let _ = reply.send(None);
+                        }
+                    }
+                }
+                // Manager dropped — keep waiting for the natural exit.
+                None => {
+                    let exit_code = child.wait().await.ok().and_then(|s| s.code());
+                    finalize_process_exit(&name, exit_code, &runtime).await;
+                    announce_natural_exit(&name, exit_code, app_state.as_ref()).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Record a process exit in the shared state and untrack its actor.
+/// Output readers are only untracked — they drain remaining lines until EOF.
+async fn finalize_process_exit(
+    name: &str,
+    exit_code: Option<i32>,
+    runtime: &Arc<Mutex<RuntimeState>>,
+) {
+    let mut rt = runtime.lock().await;
+    rt.actors.remove(name);
+    rt.output_handles.remove(name);
+    if let Some(info) = rt.processes.get_mut(name) {
+        if let Some(start_time) = info.last_restart {
+            info.cumulative_runtime += start_time.elapsed();
+        }
+        info.status = ProcessStatus::Stopped;
+        info.stopped_at = Some(Instant::now());
+        info.exit_code = exit_code;
+    }
+}
+
+/// Log a natural (not manager-initiated) process exit to the UI.
+async fn announce_natural_exit(
+    name: &str,
+    exit_code: Option<i32>,
+    app_state: Option<&Arc<AppState>>,
+) {
+    if let Some(state) = app_state {
+        let exit_msg = match exit_code {
+            Some(0) => format!("Process '{name}' exited cleanly"),
+            Some(EXIT_CODE_FORCED_TERMINATION) => {
+                format!("Process '{name}' terminated gracefully")
+            }
+            Some(EXIT_CODE_KEYBOARD_INTERRUPT) | Some(EXIT_CODE_CTRL_C_WINDOWS) => {
+                format!("Process '{name}' interrupted gracefully")
+            }
+            Some(code) => format!("Process '{name}' exited with code {code}"),
+            None => format!("Process '{name}' terminated by signal"),
+        };
+        state.add_system_log(exit_msg).await;
     }
 }
 
