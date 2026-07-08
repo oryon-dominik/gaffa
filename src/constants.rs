@@ -4,9 +4,7 @@ use std::time::Duration;
 // Default graceful shutdown timeout — overridable at runtime via
 // `--shutdown-timeout` (see `ProcessManager::set_shutdown_timeout`).
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-/// Window for graceful termination (SIGTERM on Unix, Ctrl+Break on Windows)
-/// before escalating to a force kill.
-pub const SIGTERM_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Window to confirm a force-killed process has actually exited.
 pub const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a terminating process to exit.
 pub const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(100);

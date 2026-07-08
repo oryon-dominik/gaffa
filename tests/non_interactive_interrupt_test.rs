@@ -63,26 +63,6 @@ test2: while ($true) { Write-Host 'Process 2'; Start-Sleep -Seconds 1 }
 }
 
 #[test]
-#[allow(clippy::const_is_empty)]
-fn test_termination_summary_format() {
-    // This test verifies the termination summary is properly formatted
-    // We can't easily test the actual Ctrl+C behavior in automated tests
-
-    // The termination summary should include:
-    // - A header with "Session terminated"
-    // - Column headers: process, status, runtime
-    // - Each process with its status
-
-    // This is more of a regression test to ensure the format doesn't change
-    let expected_header = "Session terminated";
-    let expected_columns = "process";
-
-    // These strings should appear in the termination summary
-    assert!(!expected_header.is_empty());
-    assert!(!expected_columns.is_empty());
-}
-
-#[test]
 fn test_non_interactive_normal_exit() {
     // Create a test Procfile with processes that exit quickly
     let procfile_content = if cfg!(windows) {
